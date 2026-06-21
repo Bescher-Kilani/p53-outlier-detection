@@ -32,19 +32,24 @@ are gitignored — see "Reproducing the pipeline" below.
 ## Reproducing the pipeline
 
 1. Place `train_data.data` and `train_gt.csv` (from ILIAS) in this folder.
-2. Run `notbooks/data_expolartion.ipynb` top to bottom through the cleaning
-   section. This produces `train_data_clean.parquet` (cleaning steps:
-   drop fully-empty rows, drop rows missing the 2D block, drop exact
-   duplicates, downcast to float32, drop the empty trailing column).
-3. Copy `train_data_clean.parquet` to the server, then run:
+2. Run `notbooks/data_expolartion.ipynb` top to bottom through **Cell 12**
+   ("Export the cleaned dataframe to Parquet"). This produces
+   `train_data_clean.parquet` (cleaning steps: drop fully-empty rows, drop
+   rows missing the 2D block, drop exact duplicates, downcast to float32,
+   drop the empty trailing column).
+3. Copy `train_data_clean.parquet` to the KIT server
+   (`server`), then run there:
    ```
    python3 compute_correlations.py
    ```
    This produces `pearson_corr.parquet` and `spearman_corr.parquet`
    (~1.7s each via matrix-multiplication, vs. minutes+ with pandas `.corr()`).
-4. Copy both result files back, continue running the notebook for
-   correlation heatmaps, top-pair / Mutual Information analysis, PCA, and
-   hierarchical clustering.
+   Run as a standalone script rather than in the notebook itself, because
+   the remote Jupyter kernel on the server had dependency issues at the time.
+4. Copy both result files back into this folder, then continue running
+   the notebook from **Cell 13** onward ("Load and plot the precomputed
+   Pearson correlation matrix") through the correlation heatmaps,
+   top-pair / Mutual Information analysis, PCA, and hierarchical clustering.
 
 ## Notebook overview
 
