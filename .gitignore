@@ -1,0 +1,10 @@
+train_data.data
+train_data_clean.parquet
+pearson_corr.parquet
+spearman_corr.parquet
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.png
+*.csv
+.~lock.*#
