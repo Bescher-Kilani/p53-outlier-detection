@@ -19,20 +19,20 @@ verification only — never for training or tuning — per the task rules.
 
 ```
 p53mutant/
-├── compute_correlations.py   # Pearson/Spearman via BLAS matmul, run on the KIT server
+├── compute_correlations.py   # Pearson/Spearman/MI via BLAS matmul, run on the KIT server
 ├── requirements.txt
 └── notbooks/
     └── data_expolartion.ipynb
 ```
 
 Raw data (`train_data.data`, `train_gt.csv`) and large intermediate files
-(`train_data_clean.parquet`, `pearson_corr.parquet`, `spearman_corr.parquet`)
-are gitignored — see "Reproducing the pipeline" below.
+(`train_data_clean.parquet`, `pearson_corr.parquet`, `spearman_corr.parquet`,
+`mi_corr.parquet`) are gitignored — see "Reproducing the pipeline" below.
 
 ## Reproducing the pipeline
 
 1. Place `train_data.data` and `train_gt.csv` (from ILIAS) in this folder.
-2. Run `notbooks/data_expolartion.ipynb` top to bottom through **Cell 12**
+2. Run `notbooks/data_expolartion.ipynb` top to bottom through **Cell 11**
    ("Export the cleaned dataframe to Parquet"). This produces
    `train_data_clean.parquet` (cleaning steps: drop fully-empty rows, drop
    rows missing the 2D block, drop exact duplicates, downcast to float32,
@@ -43,20 +43,22 @@ are gitignored — see "Reproducing the pipeline" below.
    python3 compute_correlations.py
    ```
    This produces `pearson_corr.parquet` and `spearman_corr.parquet`
-   (~1.7s each via matrix-multiplication, vs. minutes+ with pandas `.corr()`).
+   (~1.7s each via matrix-multiplication, vs. minutes+ with pandas `.corr()`),
+   plus `mi_corr.parquet` (Mutual Information via quantile-binned joint
+   histograms + matrix-multiplication, ~30s).
    Run as a standalone script rather than in the notebook itself, because
    the remote Jupyter kernel on the server had dependency issues at the time.
-4. Copy both result files back into this folder, then continue running
-   the notebook from **Cell 13** onward ("Load and plot the precomputed
-   Pearson correlation matrix") through the correlation heatmaps,
-   top-pair / Mutual Information analysis, PCA, and hierarchical clustering.
+4. Copy all three result files back into this folder, then continue running
+   the notebook from **Cell 12** onward ("Load and plot the precomputed
+   Pearson correlation matrix") through the Pearson, Spearman, and Mutual
+   Information heatmaps, the top-pairs analysis, and PCA.
 
 ## Notebook overview
 
 Setup → structure inspection → missing-value analysis → cleaning pipeline
 → label alignment (verification only) → Parquet export → correlation
-heatmaps → top-pairs + Mutual Information → PCA → hierarchical clustering
-→ summary.
+heatmaps (Pearson, Spearman, Mutual Information) → top-pairs analysis →
+PCA → summary.
 
 ## Week 1 — key findings
 
@@ -65,11 +67,11 @@ heatmaps → top-pairs + Mutual Information → PCA → hierarchical clustering
 - Cleaned: 30,754 rows (dropped 137 fully-empty, 124 missing the 2D block,
   5 duplicates)
 - Size: 3.2 GB CSV → 665.5 MB in-RAM (float32) → 281.4 MB Parquet
-- Correlation: mostly weak; one strong block (~index 2400–4800); a few
-  long-range pairs (e.g. 3197–4649) confirmed by Mutual Information
+- Correlation: all 3 methods (Pearson, Spearman, MI) confirm one strong
+  block (~index 2400–4800); Spearman/MI narrow it to a tighter hot zone
+  (~index 3190–4690); MI uniquely flags extra long-range pairs (e.g.
+  3299–4383); Pearson/Spearman also reveal a negatively correlated region
+  outside the block (~index 4500–5300)
 - PCA: 147 of 5,408 components capture 95% variance (not standardized,
   to preserve outlier-driven variance)
-- Hierarchical clustering: reordering reveals correlated feature groups
-  hidden in the original index order, including one inverse block
-  (~index 4500–5300)
 - Labels (verification only): 30,693 inactive / 61 active (~503:1)

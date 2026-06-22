@@ -8,3 +8,5 @@ __pycache__/
 *.png
 *.csv
 .~lock.*#
+*.parquet
+*.pdf
