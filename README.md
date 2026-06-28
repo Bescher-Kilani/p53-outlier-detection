@@ -23,6 +23,7 @@ p53mutant/
 ├── requirements.txt
 ├── split_data.py              # cleans the raw data, creates train/test split
 ├── p53_od_pipeline.py         # outlier detection pipeline (the deliverable)
+├── eval_internal_test_auc.py  # our own check of the final prediction (not part of the pipeline)
 ├── compute_correlations.py    # Pearson/Spearman/MI via BLAS matmul, run on the KIT server
 └── notbooks/
     └── data_expolartion.ipynb # exploration & correlation/PCA plots only,
@@ -55,6 +56,21 @@ source venv/bin/activate
    `train_labels_p53mutant.csv`, and
    `_internal_test_labels_DO_NOT_USE_IN_PIPELINE.csv` (kept aside for our
    own verification only — never read by the pipeline itself).
+
+   **Why a stratified split?** Only 61 of 30,754 mutants are active
+   (~503:1 imbalance). A purely random split could leave one side with
+   very few or zero active cases, making any AUC computed on it
+   unreliable. `train_test_split(..., stratify=labels)` keeps both sides
+   proportional (49 active in train, 12 in test).
+
+   **Why two separate label files?** `train_labels_p53mutant.csv` is the
+   only one the pipeline ever reads, and only for a post-hoc AUC check
+   after fitting — never for `.fit()` itself (OCC rule, see Problem
+   Statement above). `_internal_test_labels_DO_NOT_USE_IN_PIPELINE.csv`
+   holds back the other 12 active cases on purpose, so we can score our
+   own final prediction afterwards without ever letting these labels
+   reach the pipeline — simulating the secret hold-out set the course
+   staff will grade us on.
 3. Run the outlier detection pipeline:
    ```bash
    python p53_od_pipeline.py --method isolation_forest --reduce pca
@@ -63,6 +79,11 @@ source venv/bin/activate
    options (`--method isolation_forest|lof|gmd_lof`, `--reduce
    none|pca|random_projection|truncated_svd|isomap|umap`, `--sweep` to
    compare several `--n-components` values for one method in a single run).
+4. Check the prediction against the internal test labels (our own
+   sanity check, separate from the pipeline):
+   ```bash
+   python eval_internal_test_auc.py
+   ```
 
 ## Notebook (exploration only)
 
