@@ -19,46 +19,59 @@ verification only — never for training or tuning — per the task rules.
 
 ```
 p53mutant/
-├── compute_correlations.py   # Pearson/Spearman/MI via BLAS matmul, run on the KIT server
+├── setup.sh                   # one-time environment setup
 ├── requirements.txt
+├── split_data.py              # cleans the raw data, creates train/test split
+├── p53_od_pipeline.py         # outlier detection pipeline (the deliverable)
+├── compute_correlations.py    # Pearson/Spearman/MI via BLAS matmul, run on the KIT server
 └── notbooks/
-    └── data_expolartion.ipynb
+    └── data_expolartion.ipynb # exploration & correlation/PCA plots only,
+                                # not required to run the pipeline
 ```
 
-Raw data (`train_data.data`, `train_gt.csv`) and large intermediate files
-(`train_data_clean.parquet`, `pearson_corr.parquet`, `spearman_corr.parquet`,
-`mi_corr.parquet`) are gitignored — see "Reproducing the pipeline" below.
+Raw data (`train_data.data`, `train_gt.csv`, ~3.3 GB) is gitignored — see
+"Reproducing the pipeline" below. So are the files it produces
+(`train_set_p53mutant.parquet`, `test_set_p53mutant.parquet`,
+`train_labels_p53mutant.csv`, `train_data_clean.parquet`,
+`pearson_corr.parquet`, `spearman_corr.parquet`, `mi_corr.parquet`).
+
+## Setup
+
+```bash
+git clone https://github.com/Bescher-Kilani/p53-outlier-detection.git
+cd p53mutant
+bash setup.sh
+source venv/bin/activate
+```
 
 ## Reproducing the pipeline
 
 1. Place `train_data.data` and `train_gt.csv` (from ILIAS) in this folder.
-2. Run `notbooks/data_expolartion.ipynb` top to bottom through **Cell 11**
-   ("Export the cleaned dataframe to Parquet"). This produces
-   `train_data_clean.parquet` (cleaning steps: drop fully-empty rows, drop
-   rows missing the 2D block, drop exact duplicates, downcast to float32,
-   drop the empty trailing column).
-3. Copy `train_data_clean.parquet` to the KIT server
-   (`server`), then run there:
+2. Clean the data and create the stratified train/test split:
+   ```bash
+   python split_data.py
    ```
-   python3 compute_correlations.py
+   Produces `train_set_p53mutant.parquet`, `test_set_p53mutant.parquet`,
+   `train_labels_p53mutant.csv`, and
+   `_internal_test_labels_DO_NOT_USE_IN_PIPELINE.csv` (kept aside for our
+   own verification only — never read by the pipeline itself).
+3. Run the outlier detection pipeline:
+   ```bash
+   python p53_od_pipeline.py --method isolation_forest --reduce pca
    ```
-   This produces `pearson_corr.parquet` and `spearman_corr.parquet`
-   (~1.7s each via matrix-multiplication, vs. minutes+ with pandas `.corr()`),
-   plus `mi_corr.parquet` (Mutual Information via quantile-binned joint
-   histograms + matrix-multiplication, ~30s).
-   Run as a standalone script rather than in the notebook itself, because
-   the remote Jupyter kernel on the server had dependency issues at the time.
-4. Copy all three result files back into this folder, then continue running
-   the notebook from **Cell 12** onward ("Load and plot the precomputed
-   Pearson correlation matrix") through the Pearson, Spearman, and Mutual
-   Information heatmaps, the top-pairs analysis, and PCA.
+   Produces `outputs/team2_prediction.csv`. Run with `--help` to see all
+   options (`--method isolation_forest|lof|gmd_lof`, `--reduce
+   none|pca|random_projection|truncated_svd|isomap|umap`, `--sweep` to
+   compare several `--n-components` values for one method in a single run).
 
-## Notebook overview
+## Notebook (exploration only)
 
-Setup → structure inspection → missing-value analysis → cleaning pipeline
-→ label alignment (verification only) → Parquet export → correlation
-heatmaps (Pearson, Spearman, Mutual Information) → top-pairs analysis →
-PCA → summary.
+`notbooks/data_expolartion.ipynb` documents the original exploration:
+structure inspection, missing-value analysis, the cleaning logic later
+ported into `split_data.py`, and the correlation/PCA analysis
+(`compute_correlations.py` runs the heavy Pearson/Spearman/MI computation
+on the KIT server; results are copied back and plotted in the notebook).
+Not required to reproduce the pipeline above.
 
 ## Week 1 — key findings
 
@@ -75,3 +88,43 @@ PCA → summary.
 - PCA: 147 of 5,408 components capture 95% variance (not standardized,
   to preserve outlier-driven variance)
 - Labels (verification only): 30,693 inactive / 61 active (~503:1)
+
+## Week 2 — key findings
+
+- Pipeline rebuilt as two standalone scripts (`split_data.py`,
+  `p53_od_pipeline.py`) instead of notebook cells, mirroring the
+  cleaning/pipeline split from the Earthquake task
+- OCC discipline maintained throughout: labels never enter `.fit()`,
+  used only for the stratified split itself and the post-hoc AUC check
+- Six dimensionality reduction methods compared on the same raw
+  5,408-feature input (fairness), scored with Isolation Forest,
+  n_components=147 unless noted:
+
+  | Reduction               | AUC    |
+  |--------------------------|--------|
+  | PCA                      | 0.6733 |
+  | TruncatedSVD             | 0.6657 |
+  | none (raw)               | 0.5902 |
+  | Isomap                   | 0.5649 |
+  | Random Projection        | 0.5232 |
+  | UMAP (best of k=5..300)  | 0.4013 |
+
+  Linear, variance-preserving methods (PCA, SVD) outperform manifold
+  methods (Isomap, UMAP — local-neighborhood-preserving) and Random
+  Projection (distance-preserving but data-blind) for this task
+
+- GMD (subspace search) + LOF, tested across reduction methods:
+
+  | Reduction               | Subspaces found | Runtime | AUC    |
+  |--------------------------|-----------------|---------|--------|
+  | none (raw, 5,408 dims)   | —               | >36h, never finished | — |
+  | PCA (147)                | 147             | 577.1s  | 0.6078 |
+  | Random Projection (147)  | 147             | 361.3s  | 0.6276 |
+
+  GMD's pairwise subspace search is O(d²) and intractable on the raw
+  5,408 dimensions — feasible only after a prior dimensionality
+  reduction step. GMD+LOF on Random Projection beats GMD+LOF on PCA,
+  plausibly because PCA already removes the correlation structure GMD
+  searches for
+
+- Current best: **Isolation Forest + PCA (147 components), AUC 0.6733**
