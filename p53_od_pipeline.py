@@ -4,11 +4,12 @@ Team 2 - DS Lab 2026
 
 Pipeline Steps:
 1. Load train_set/test_set/train_labels (produced by split_data.py)
-2. Fit an unsupervised outlier detector on train_set features only (no labels)
-   - isolation_forest: optionally preceded by PCA or Random Projection
-   - gmd_lof: GMD subspace search + LOF, scores summed across subspaces
+2. Fit an unsupervised sklearn Pipeline on train_set features only (no labels)
+   - scale step (optional): StandardScaler, fit on train fold / full train only
+   - reduction step (optional): PCA, Random Projection, etc.
+   - detector step: Isolation Forest, LOF, or GMD+LOF ensemble
 3. Score train_set and test_set
-4. Internal AUC check: compare train_set scores against train_labels
+4. Internal metrics check (train_set only, 3-fold stratified CV): AUC and MCC as mean ± std
 5. Save test_set scores as team2_prediction.csv
 
 Requires for --method gmd_lof: pip install gmd
@@ -20,10 +21,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator
+from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.ensemble import IsolationForest
-from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.random_projection import GaussianRandomProjection
-from sklearn.metrics import roc_auc_score
+
+from mrmr_ifs import MRMRIFSSelector
 
 
 def load_data():
@@ -43,140 +51,359 @@ def load_data():
 	return X_train, X_test, train_labels
 
 
-def reduce_dimensions(X_train, X_test, method="none", n_components=147, random_state=42):
-	# Fit only on X_train, then transform both - same no-leakage rule as the split.
-	if method == "none":
-		return X_train, X_test
+def make_reducer(reduce, n_components, random_state):
+	if reduce == "none":
+		return "passthrough"
 
-	print("="*60)
-	print(f"DIMENSIONALITY REDUCTION ({method}, n_components={n_components})")
-	print("="*60)
-
-	t0 = time.time()
-	if method == "pca":
-		reducer = PCA(n_components=n_components, random_state=random_state)
-	elif method == "random_projection":
-		reducer = GaussianRandomProjection(n_components=n_components, random_state=random_state)
-	elif method == "truncated_svd":
-		from sklearn.decomposition import TruncatedSVD
-		reducer = TruncatedSVD(n_components=n_components, random_state=random_state)
-	elif method == "isomap":
+	if reduce == "pca":
+		return PCA(n_components=n_components, random_state=random_state)
+	if reduce == "random_projection":
+		return GaussianRandomProjection(n_components=n_components, random_state=random_state)
+	if reduce == "truncated_svd":
+		return TruncatedSVD(n_components=n_components, random_state=random_state)
+	if reduce == "isomap":
 		from sklearn.manifold import Isomap
-		reducer = Isomap(n_components=n_components)
-	elif method == "umap":
+		return Isomap(n_components=n_components)
+	if reduce == "umap":
 		import umap  # pip install umap-learn
-		reducer = umap.UMAP(n_components=n_components, random_state=random_state)
-	else:
-		raise ValueError(f"Unknown method: {method}")
+		return umap.UMAP(n_components=n_components, random_state=random_state)
 
-	X_train_red = reducer.fit_transform(X_train)
-	X_test_red = reducer.transform(X_test)
+	raise ValueError(f"Unknown reduction method: {reduce}")
 
-	if method == "pca":
+
+class GMDLOFEnsemble(BaseEstimator):
+	# sklearn-compatible final step for Pipeline; sums LOF scores across GMD subspaces.
+	def __init__(self, max_subspaces=None, random_state=42):
+		self.max_subspaces = max_subspaces
+		self.random_state = random_state
+
+	def fit(self, X, y=None):
+		from gmd import GMD
+
+		X_arr = np.asarray(X)
+		t0 = time.time()
+		gmd = GMD()
+		gmd.fit(X_arr)
+		subspace_items = list(gmd.subspaces_.items())
+		self.n_subspaces_found_ = len(subspace_items)
+		if self.max_subspaces is not None:
+			subspace_items = subspace_items[:self.max_subspaces]
+		self.subspace_items_ = subspace_items
+		self.lof_models_ = []
+		for i, (_, cols) in enumerate(subspace_items):
+			lof = LocalOutlierFactor(novelty=True, n_jobs=-1)
+			lof.fit(X_arr[:, cols])
+			self.lof_models_.append((cols, lof))
+			if (i + 1) % 50 == 0 or (i + 1) == len(subspace_items):
+				print(f"  Subspace {i+1}/{len(subspace_items)}  ({time.time()-t0:.1f}s elapsed)")
+		self.fit_time_ = time.time() - t0
+		return self
+
+	def score_samples(self, X):
+		X_arr = np.asarray(X)
+		scores = np.zeros(len(X_arr))
+		for cols, lof in self.lof_models_:
+			scores += lof.score_samples(X_arr[:, cols])
+		return scores
+
+
+def make_detector(method, n_estimators, random_state, max_subspaces):
+	if method == "isolation_forest":
+		return IsolationForest(
+			n_estimators=n_estimators,
+			random_state=random_state,
+			n_jobs=-1,
+		)
+	if method == "lof":
+		return LocalOutlierFactor(novelty=True, n_jobs=-1)
+	if method == "gmd_lof":
+		return GMDLOFEnsemble(max_subspaces=max_subspaces, random_state=random_state)
+	raise ValueError(f"Unknown method: {method}")
+
+
+def build_pipeline(reduce, method, n_components=147, n_estimators=200,
+                   random_state=42, max_subspaces=None, scale=True,
+                   feature_select=None):
+	steps = []
+	if scale:
+		steps.append(("scale", StandardScaler()))
+	if feature_select == "mrmr_ifs":
+		steps.append(("select", MRMRIFSSelector(
+			max_features=n_components,
+			random_state=random_state,
+			n_estimators=min(100, n_estimators),
+		)))
+		reduce = "none"
+	steps.extend([
+		("reduce", make_reducer(reduce, n_components, random_state)),
+		("detector", make_detector(method, n_estimators, random_state, max_subspaces)),
+	])
+	return Pipeline(steps)
+
+
+def _transform_features(pipeline, X):
+	prep = pipeline[:-1]
+	if not prep.steps or all(step == "passthrough" for _, step in prep.steps):
+		return X
+	return prep.transform(X)
+
+
+def anomaly_scores(pipeline, X):
+	# sklearn score_samples: higher = more normal; flip for higher = more anomalous.
+	X_red = _transform_features(pipeline, X)
+	return -pipeline.named_steps["detector"].score_samples(X_red)
+
+
+def fit_pipeline_train(pipeline, X_train, train_labels=None, smote=False):
+	needs_custom = smote or "select" in pipeline.named_steps
+	if not needs_custom:
+		pipeline.fit(X_train)
+		return pipeline
+
+	from imblearn.over_sampling import SMOTE
+
+	X = X_train
+	y = None
+	if train_labels is not None:
+		y = np.asarray(train_labels == "active", dtype=int)
+
+	if "scale" in pipeline.named_steps:
+		X = pipeline.named_steps["scale"].fit_transform(X_train)
+
+	if smote:
+		n_minority = int(y.sum())
+		k_neighbors = min(5, n_minority - 1)
+		if k_neighbors < 1:
+			raise ValueError(f"Not enough minority samples for SMOTE (n={n_minority})")
+		X, y = SMOTE(random_state=42, k_neighbors=k_neighbors).fit_resample(X, y)
+
+	if "select" in pipeline.named_steps:
+		selector = pipeline.named_steps["select"]
+		selector.fit(X, y)
+		X = selector.transform(X)
+
+	reducer = pipeline.named_steps["reduce"]
+	X_red = X if reducer == "passthrough" else reducer.fit_transform(X)
+	pipeline.named_steps["detector"].fit(X_red)
+	return pipeline
+
+
+def log_reduction(pipeline, input_shape, reduce, n_train=None):
+	if reduce == "none":
+		return
+
+	reducer = pipeline.named_steps["reduce"]
+	print("="*60)
+	print(f"DIMENSIONALITY REDUCTION ({reduce}, "
+	      f"n_components={getattr(reducer, 'n_components', '?')})")
+	print("="*60)
+	if reduce == "pca":
 		print(f"Explained variance: {reducer.explained_variance_ratio_.sum():.2%}")
-
-	print(f"Shape: {X_train.shape} -> {X_train_red.shape}  ({time.time()-t0:.1f}s)")
+	print(f"Shape: {input_shape} -> ({n_train or input_shape[0]}, {reducer.n_components})")
 	print("="*60 + "\n")
 
-	return X_train_red, X_test_red
 
-
-def fit_isolation_forest(X_train, n_estimators=200, random_state=42):
+def log_detector_fit(pipeline, method, n_train, elapsed):
 	print("="*60)
-	print("FITTING ISOLATION FOREST")
+	if method == "isolation_forest":
+		print("FITTING ISOLATION FOREST")
+	elif method == "lof":
+		print("FITTING LOF (single model, no subspace ensemble)")
+	elif method == "gmd_lof":
+		detector = pipeline.named_steps["detector"]
+		print("FITTING GMD + LOF (subspace ensemble)")
+		print(f"GMD found {detector.n_subspaces_found_} subspaces "
+		      f"(using {len(detector.subspace_items_)})")
+		elapsed = detector.fit_time_
 	print("="*60)
+	print(f"Fitted on {n_train:,} samples in {elapsed:.1f}s")
+	print("="*60 + "\n")
 
+
+def fit_pipeline(pipeline, X_train, method, reduce, scale=True, train_labels=None, smote=False):
+	input_shape = X_train.shape
+	if scale:
+		print("="*60)
+		print("STANDARDIZING FEATURES (StandardScaler, fit on train only)")
+		print("="*60 + "\n")
+	if smote:
+		print("="*60)
+		print("SMOTE on train only (after scaling, before reduction/detector)")
+		print("="*60 + "\n")
 	t0 = time.time()
-	model = IsolationForest(
-		n_estimators=n_estimators,
-		random_state=random_state,
-		n_jobs=-1,
-	)
-	model.fit(X_train)
-	print(f"Fitted on {len(X_train):,} samples in {time.time()-t0:.1f}s")
-	print("="*60 + "\n")
-
-	return model
-
-
-def anomaly_scores(model, X):
-	# sklearn's score_samples: higher = more normal, so we flip the sign
-	# to get higher = more anomalous (matches our AUC convention).
-	return -model.score_samples(X)
+	fit_pipeline_train(pipeline, X_train, train_labels, smote=smote)
+	elapsed = time.time() - t0
+	n_train = None
+	if smote and "reduce" in pipeline.named_steps:
+		reducer = pipeline.named_steps["reduce"]
+		if reducer != "passthrough" and hasattr(reducer, "n_components"):
+			n_train = getattr(reducer, "n_samples_", None)
+	log_reduction(pipeline, input_shape, reduce, n_train=n_train)
+	log_detector_fit(pipeline, method, n_train or len(X_train), elapsed)
+	return pipeline
 
 
-def fit_score_lof(X_train, X_test, random_state=42):
-	from sklearn.neighbors import LocalOutlierFactor
+def _mcc_from_counts(tp, tn, fp, fn):
+	tp, tn, fp, fn = float(tp), float(tn), float(fp), float(fn)
+	denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+	if denom == 0:
+		return 0.0
+	return (tp * tn - fp * fn) / np.sqrt(denom)
 
+
+def _best_mcc_threshold(y_true, scores):
+	# O(n): try predicting the top-k highest scores as active (k = 0..n).
+	# Equivalent to sweeping thresholds with >=; avoids O(n^2) over np.unique(scores).
+	y_true = np.asarray(y_true)
+	scores = np.asarray(scores)
+	order = np.argsort(-scores, kind="mergesort")
+	y_sorted = y_true[order]
+
+	n_pos = int(y_true.sum())
+	n_neg = len(y_true) - n_pos
+
+	best_mcc = -1.0
+	best_thresh = float(np.min(scores)) - 1.0
+	tp = 0
+
+	# k=0: predict nobody active
+	mcc = _mcc_from_counts(0, n_neg, 0, n_pos)
+	if mcc > best_mcc:
+		best_mcc = mcc
+		best_thresh = float(np.max(scores)) + 1.0
+
+	for k, idx in enumerate(order):
+		tp += y_sorted[k]
+		fp = (k + 1) - tp
+		fn = n_pos - tp
+		tn = n_neg - fp
+		mcc = _mcc_from_counts(tp, tn, fp, fn)
+		if mcc > best_mcc:
+			best_mcc = mcc
+			best_thresh = float(scores[idx])
+
+	return best_thresh, best_mcc
+
+
+def _print_confusion_matrix(cm):
+	print("Confusion matrix (rows=actual, cols=predicted):")
+	print(f"{'':>12} {'inactive':>10} {'active':>10}")
+	print(f"{'inactive':>12} {cm[0, 0]:>10} {cm[0, 1]:>10}")
+	print(f"{'active':>12} {cm[1, 0]:>10} {cm[1, 1]:>10}")
+	print(f"  TN={cm[0, 0]}  FP={cm[0, 1]}  FN={cm[1, 0]}  TP={cm[1, 1]}")
+
+
+def evaluate_labeled_scores(scores, labels, title="INTERNAL METRICS CHECK (train_set only, never used for fitting)"):
 	print("="*60)
-	print("FITTING LOF (single model, no subspace ensemble)")
-	print("="*60)
-
-	t0 = time.time()
-	lof = LocalOutlierFactor(novelty=True, n_jobs=-1)
-	lof.fit(X_train)
-	print(f"Fitted on {len(X_train):,} samples in {time.time()-t0:.1f}s")
-	print("="*60 + "\n")
-
-	train_scores = -lof.score_samples(X_train)
-	test_scores = -lof.score_samples(X_test)
-	return train_scores, test_scores
-
-
-def fit_score_gmd_lof(X_train, X_test, random_state=42, max_subspaces=None):
-	from gmd import GMD
-	from sklearn.neighbors import LocalOutlierFactor
-
-	print("="*60)
-	print("FITTING GMD + LOF (subspace ensemble)")
-	print("="*60)
-
-	# Works on either a DataFrame (raw) or ndarray (e.g. after PCA) input.
-	X_train_arr = np.asarray(X_train)
-	X_test_arr = np.asarray(X_test)
-
-	t0 = time.time()
-	gmd = GMD()
-	gmd.fit(X_train_arr)
-	subspace_items = list(gmd.subspaces_.items())
-	n_found = len(subspace_items)
-	if max_subspaces is not None:
-		subspace_items = subspace_items[:max_subspaces]
-	print(f"GMD found {n_found} subspaces in {time.time()-t0:.1f}s "
-	      f"(using {len(subspace_items)})")
-
-	train_scores = np.zeros(len(X_train_arr))
-	test_scores = np.zeros(len(X_test_arr))
-
-	for i, (key, cols) in enumerate(subspace_items):
-		# novelty=True lets us score X_test from a model fit only on X_train.
-		# Using score_samples on X_train itself (for the internal AUC check
-		# only) is a known minor inconsistency in novelty mode - acceptable
-		# here since it never touches the official test_set prediction.
-		lof = LocalOutlierFactor(novelty=True, n_jobs=-1)
-		lof.fit(X_train_arr[:, cols])
-		train_scores += -lof.score_samples(X_train_arr[:, cols])
-		test_scores += -lof.score_samples(X_test_arr[:, cols])
-		if (i + 1) % 50 == 0 or (i + 1) == len(subspace_items):
-			print(f"  Subspace {i+1}/{len(subspace_items)}  ({time.time()-t0:.1f}s elapsed)")
-
-	print(f"Done in {time.time()-t0:.1f}s")
-	print("="*60 + "\n")
-
-	return train_scores, test_scores
-
-
-def evaluate_internal_auc(train_scores, train_labels):
-	print("="*60)
-	print("INTERNAL AUC CHECK (train_set only, never used for fitting)")
+	print(title)
 	print("="*60)
 
-	y_true = (train_labels == "active").astype(int)
-	auc = roc_auc_score(y_true, train_scores)
+	y_true = np.asarray(labels == "active", dtype=int)
+	scores = np.asarray(scores)
+	auc = roc_auc_score(y_true, scores)
+	threshold, mcc = _best_mcc_threshold(y_true, scores)
+	y_pred = (scores >= threshold).astype(int)
+	cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
 	print(f"AUC: {auc:.4f}")
+	print(f"MCC: {mcc:.4f}  (threshold={threshold:.6f}, higher score = more anomalous)")
+	_print_confusion_matrix(cm)
 	print("="*60 + "\n")
 
-	return auc
+	return {"auc": auc, "mcc": mcc, "threshold": threshold, "confusion_matrix": cm}
+
+
+def evaluate_internal_metrics(train_scores, train_labels):
+	return evaluate_labeled_scores(train_scores, train_labels)
+
+
+def evaluate_full_train_metrics(X_train, train_labels, args):
+	pipeline = build_pipeline(
+		reduce=args.reduce,
+		method=args.method,
+		n_components=args.n_components,
+		n_estimators=args.n_estimators,
+		random_state=args.random_state,
+		max_subspaces=args.max_subspaces,
+		scale=args.scale,
+		feature_select=getattr(args, "feature_select", None),
+	)
+	fit_pipeline_train(
+		pipeline, X_train, train_labels,
+		smote=getattr(args, "smote", False),
+	)
+	scores = anomaly_scores(pipeline, X_train)
+	y_true = np.asarray(train_labels == "active", dtype=int)
+	auc = roc_auc_score(y_true, scores)
+	_, mcc = _best_mcc_threshold(y_true, scores)
+	if "select" in pipeline.named_steps:
+		sel = pipeline.named_steps["select"]
+		print(f"  mRMR+IFS selected {sel.n_features_selected_} features (IFS train AUC={sel.ifs_best_auc_:.4f})")
+	return {"auc": auc, "mcc": mcc}
+
+
+def cross_validate_train_metrics(X_train, train_labels, args, n_splits=3):
+	y = np.asarray(train_labels == "active", dtype=int)
+	skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=args.random_state)
+	fold_aucs, fold_mccs = [], []
+
+	for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y), start=1):
+		X_tr = X_train.iloc[train_idx]
+		X_val = X_train.iloc[val_idx]
+		labels_val = train_labels.iloc[val_idx]
+		labels_tr = train_labels.iloc[train_idx]
+
+		pipeline = build_pipeline(
+			reduce=args.reduce,
+			method=args.method,
+			n_components=args.n_components,
+			n_estimators=args.n_estimators,
+			random_state=args.random_state,
+			max_subspaces=args.max_subspaces,
+			scale=args.scale,
+			feature_select=getattr(args, "feature_select", None),
+		)
+		fit_pipeline_train(
+			pipeline, X_tr, labels_tr,
+			smote=getattr(args, "smote", False),
+		)
+		scores_val = anomaly_scores(pipeline, X_val)
+
+		y_true = np.asarray(labels_val == "active", dtype=int)
+		if y_true.sum() == 0 or y_true.sum() == len(y_true):
+			print(f"  fold {fold}/{n_splits}: skipped (validation fold has a single class)")
+			continue
+		fold_aucs.append(roc_auc_score(y_true, scores_val))
+		_, mcc = _best_mcc_threshold(y_true, scores_val)
+		fold_mccs.append(mcc)
+		print(f"  fold {fold}/{n_splits}: AUC={fold_aucs[-1]:.4f}  MCC={fold_mccs[-1]:.4f}")
+
+	if not fold_aucs:
+		raise ValueError("CV produced no valid folds (each validation split had only one class)")
+
+	auc_mean, auc_std = np.mean(fold_aucs), np.std(fold_aucs, ddof=1)
+	mcc_mean, mcc_std = np.mean(fold_mccs), np.std(fold_mccs, ddof=1)
+	return {
+		"auc": auc_mean,
+		"auc_std": auc_std,
+		"mcc": mcc_mean,
+		"mcc_std": mcc_std,
+		"fold_aucs": fold_aucs,
+		"fold_mccs": fold_mccs,
+		"n_splits": n_splits,
+	}
+
+
+def print_cv_train_metrics(metrics, n_splits, smote=False):
+	suffix = ""
+	if smote:
+		suffix = ", SMOTE on train fold"
+	print("=" * 60)
+	print(f"INTERNAL METRICS CHECK ({n_splits}-fold stratified CV on train{suffix})")
+	print("=" * 60)
+	print(f"AUC: {metrics['auc']:.4f} +/- {metrics['auc_std']:.4f}")
+	print(f"MCC: {metrics['mcc']:.4f} +/- {metrics['mcc_std']:.4f}")
+	print("=" * 60 + "\n")
 
 
 def save_prediction(test_scores, test_ids, path="outputs/team2_prediction.csv"):
@@ -192,6 +419,33 @@ def save_prediction(test_scores, test_ids, path="outputs/team2_prediction.csv"):
 	print("="*60 + "\n")
 
 
+def run_pipeline(X_train, X_test, train_labels, test_ids, args, save=True):
+	cv_metrics = cross_validate_train_metrics(
+		X_train, train_labels, args, n_splits=args.cv_folds,
+	)
+	print_cv_train_metrics(cv_metrics, args.cv_folds, smote=getattr(args, "smote", False))
+
+	pipeline = build_pipeline(
+		reduce=args.reduce,
+		method=args.method,
+		n_components=args.n_components,
+		n_estimators=args.n_estimators,
+		random_state=args.random_state,
+		max_subspaces=args.max_subspaces,
+		scale=args.scale,
+		feature_select=getattr(args, "feature_select", None),
+	)
+	fit_pipeline(
+		pipeline, X_train, args.method, args.reduce,
+		scale=args.scale, train_labels=train_labels, smote=getattr(args, "smote", False),
+	)
+	test_scores = anomaly_scores(pipeline, X_test)
+
+	if save:
+		save_prediction(test_scores, test_ids)
+	return cv_metrics
+
+
 def main():
 	parser = argparse.ArgumentParser(description="p53 Outlier Detection Pipeline")
 	parser.add_argument("--method", type=str, default="isolation_forest",
@@ -200,9 +454,18 @@ def main():
 	parser.add_argument("--n-estimators", type=int, default=200,
 	                     help="Number of trees in the Isolation Forest")
 	parser.add_argument("--random-state", type=int, default=42)
+	parser.add_argument("--cv-folds", type=int, default=3,
+	                     help="K-fold CV on train for internal AUC/MCC (mean ± std)")
+	parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True,
+	                     help="StandardScaler before reduction (fit on train fold in CV, full train for final model)")
+	parser.add_argument("--smote", action=argparse.BooleanOptionalAction, default=False,
+	                     help="SMOTE on train fold only (after scale, before reduce/detector; uses labels on train)")
 	parser.add_argument("--reduce", type=str, default="none",
 	                     choices=["none", "pca", "random_projection", "truncated_svd", "isomap", "umap"],
 	                     help="Dimensionality reduction before fitting")
+	parser.add_argument("--feature-select", type=str, default=None,
+	                     choices=["mrmr_ifs"],
+	                     help="Supervised feature selection before detector (uses labels on train only)")
 	parser.add_argument("--n-components", type=int, default=147,
 	                     help="Components for --reduce (147 = W1 PCA result, 95%% variance)")
 	parser.add_argument("--sample", type=int, default=None,
@@ -222,72 +485,31 @@ def main():
 		train_labels = train_labels.loc[X_train.index]
 		n_active = (train_labels == "active").sum()
 		print(f"Subsampled train_set to {len(X_train):,} rows for quick testing "
-		      f"(active: {n_active} - AUC below is NOT meaningful, runtime check only)\n")
+		      f"(active: {n_active} - metrics below are NOT meaningful, runtime check only)\n")
 
 	if args.sweep:
 		k_values = [int(k) for k in args.sweep.split(",")]
 		results = []
 		for k in k_values:
-			X_train_red, X_test_red = reduce_dimensions(
-				X_train, X_test,
-				method=args.reduce,
-				n_components=k,
-				random_state=args.random_state,
-			)
-			if args.method == "isolation_forest":
-				model = fit_isolation_forest(X_train_red, n_estimators=args.n_estimators,
-				                              random_state=args.random_state)
-				train_scores = anomaly_scores(model, X_train_red)
-			elif args.method == "lof":
-				train_scores, _ = fit_score_lof(X_train_red, X_test_red,
-				                                 random_state=args.random_state)
-			elif args.method == "gmd_lof":
-				train_scores, _ = fit_score_gmd_lof(X_train_red, X_test_red,
-				                                     random_state=args.random_state,
-				                                     max_subspaces=args.max_subspaces)
-			auc = evaluate_internal_auc(train_scores, train_labels)
-			results.append((k, auc))
+			sweep_args = argparse.Namespace(**{**vars(args), "n_components": k})
+			metrics = run_pipeline(X_train, X_test, train_labels, test_ids, sweep_args, save=False)
+			results.append((k, metrics))
 
 		print("="*60)
 		print(f"SWEEP SUMMARY ({args.method} + {args.reduce})")
 		print("="*60)
-		for k, auc in results:
-			print(f"  n_components={k:<5} AUC={auc:.4f}")
-		best_k, best_auc = max(results, key=lambda r: r[1])
-		print(f"Best: n_components={best_k} (AUC={best_auc:.4f})")
+		for k, metrics in results:
+			print(f"  n_components={k:<5} "
+			      f"AUC={metrics['auc']:.4f}±{metrics['auc_std']:.4f}  "
+			      f"MCC={metrics['mcc']:.4f}±{metrics['mcc_std']:.4f}")
+		best_k, best_metrics = max(results, key=lambda r: r[1]["auc"])
+		print(f"Best (by AUC): n_components={best_k} "
+		      f"(AUC={best_metrics['auc']:.4f}±{best_metrics['auc_std']:.4f}, "
+		      f"MCC={best_metrics['mcc']:.4f}±{best_metrics['mcc_std']:.4f})")
 		print("="*60 + "\n")
 		return
 
-	X_train_red, X_test_red = reduce_dimensions(
-		X_train, X_test,
-		method=args.reduce,
-		n_components=args.n_components,
-		random_state=args.random_state,
-	)
-
-	if args.method == "isolation_forest":
-		model = fit_isolation_forest(X_train_red, n_estimators=args.n_estimators,
-		                              random_state=args.random_state)
-		train_scores = anomaly_scores(model, X_train_red)
-		test_scores = anomaly_scores(model, X_test_red)
-
-	elif args.method == "lof":
-		train_scores, test_scores = fit_score_lof(
-			X_train_red, X_test_red,
-			random_state=args.random_state,
-		)
-
-	elif args.method == "gmd_lof":
-		# Raw 5408 dims makes GMD's pairwise search intractable in practice -
-		# feed it a reduced space instead, e.g. --reduce pca.
-		train_scores, test_scores = fit_score_gmd_lof(
-			X_train_red, X_test_red,
-			random_state=args.random_state,
-			max_subspaces=args.max_subspaces,
-		)
-
-	evaluate_internal_auc(train_scores, train_labels)
-	save_prediction(test_scores, test_ids)
+	run_pipeline(X_train, X_test, train_labels, test_ids, args, save=True)
 
 
 if __name__ == "__main__":

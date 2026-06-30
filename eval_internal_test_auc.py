@@ -3,7 +3,8 @@
 # completely separate from the pipeline - never feed these labels into
 # p53_od_pipeline.py itself.
 import pandas as pd
-from sklearn.metrics import roc_auc_score
+
+from p53_od_pipeline import evaluate_labeled_scores
 
 PREDICTION_FILE = "outputs/team2_prediction.csv"
 LABELS_FILE = "_internal_test_labels_DO_NOT_USE_IN_PIPELINE.csv"
@@ -12,8 +13,8 @@ prediction = pd.read_csv(PREDICTION_FILE)
 labels = pd.read_csv(LABELS_FILE, index_col=0)["label"]
 
 merged = prediction.set_index("id").join(labels)
-y_true = (merged["label"] == "active").astype(int)
-auc = roc_auc_score(y_true, merged["score"])
-
-print(f"Test-set AUC (internal, never seen by the pipeline): {auc:.4f}")
-print(f"Active in test set: {y_true.sum()} / {len(y_true)}")
+evaluate_labeled_scores(
+	merged["score"],
+	merged["label"],
+	title="TEST-SET METRICS (internal, never seen by the pipeline)",
+)

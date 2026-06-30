@@ -3,3 +3,4 @@ pyarrow
 seaborn
 scikit-learn
 umap-learn
+imbalanced-learn
