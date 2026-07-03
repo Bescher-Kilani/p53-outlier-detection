@@ -17,11 +17,12 @@ Pipeline Steps:
    Both report AUC and MCC as mean +/- std.
 5. Save test_set scores as team2_prediction.csv
 
-Method comparison (--compare-methods): runs all 6 Week 3 OCC methods
-through repeated_subsampling (always, regardless of --eval-strategy),
-prints the per-repeat AUC matrix to the terminal (no file written) -
-this is the input for next week's Friedman/Conover-Iman test, just copy
-it from the terminal.
+Method comparison (--compare-methods): runs the Week 3 OCC methods in
+COMPARE_METHODS through repeated_subsampling (always, regardless of
+--eval-strategy), prints the per-repeat AUC matrix to the terminal (no
+file written) - this is the input for next week's Friedman/Conover-Iman
+test, just copy it from the terminal.
+
 
 """
 
@@ -45,6 +46,9 @@ from sklearn.svm import OneClassSVM
 from mrmr_ifs import MRMRIFSSelector
 
 COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod"]
+
+# Step B (Week 3 plan): Top-3 from Step A, one family each (subspace/locality/cluster)
+FEATURE_BAGGING_METHODS = ["isolation_forest", "knn", "ocsvm"]
 
 
 def load_data():
@@ -168,6 +172,21 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 		# O(n^3), infeasible at ~20k train rows)
 		return PyODAdapter(ABOD(n_neighbors=10, method="fast"))
 	raise ValueError(f"Unknown method: {method}")
+
+
+def fit_scale_reduce(X, reduce, n_components, random_state, scale):
+	# Fits scale+reduce once on the full array, separate from build_pipeline
+	# (which bundles reduce+detector together) - needed for Step B feature
+	# bagging, where the SAME reduced feature space is reused across many
+	# detector fits on different column subsets, instead of re-fitting PCA
+	# per subset.
+	X_arr = np.asarray(X, dtype=np.float64)
+	if scale:
+		X_arr = StandardScaler().fit_transform(X_arr)
+	reducer = make_reducer(reduce, n_components, random_state)
+	if reducer == "passthrough":
+		return X_arr
+	return reducer.fit_transform(X_arr)
 
 
 def build_pipeline(reduce, method, n_components=147, n_estimators=200,
@@ -535,6 +554,100 @@ def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=2
 	}
 
 
+def feature_bagging_metrics(X_train, train_labels, args, method, n_subsets=10,
+                             subset_min_frac=0.5, verbose=True):
+	# Step B (Week 3 plan): SEPARATE per method, no mixing of method and
+	# feature subspace (would confound the two effects - see chat notes).
+	# Single full-train fit-and-score check (post-hoc AUC, same convention
+	# as evaluate_full_train_metrics), NOT nested inside the 25x repeated
+	# subsampling from Step A - nesting would mean n_repeats * n_subsets
+	# fits per method, too expensive at this data size.
+	X_red = fit_scale_reduce(X_train, args.reduce, args.n_components, args.random_state, args.scale)
+	d = X_red.shape[1]
+	y_true = np.asarray(train_labels == "active", dtype=int)
+
+	# baseline: single model on the full reduced space, no bagging
+	base_detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
+	base_detector.fit(X_red)
+	base_scores = -base_detector.score_samples(X_red)
+	base_auc = roc_auc_score(y_true, base_scores)
+	if verbose:
+		print(f"  baseline (no bagging, all {d} components): AUC={base_auc:.4f}")
+
+	rng = np.random.default_rng(args.random_state)
+	subset_scores = []  # z-normalized score vectors, one per subset
+
+	for i in range(n_subsets):
+		k = int(rng.integers(int(subset_min_frac * d), d + 1))
+		cols = rng.choice(d, size=k, replace=False)
+
+		detector = make_detector(method, args.n_estimators, args.random_state + i + 1, args.max_subspaces)
+		detector.fit(X_red[:, cols])
+		scores = -detector.score_samples(X_red[:, cols])
+
+		# z-normalize before aggregation - subsets aren't on the same scale,
+		# summing/maxing raw scores would just favor whichever subset
+		# happens to produce the largest numbers (see chat notes)
+		scores_z = (scores - scores.mean()) / (scores.std() + 1e-12)
+		subset_scores.append(scores_z)
+
+		if verbose:
+			auc_i = roc_auc_score(y_true, scores)
+			print(f"  subset {i+1}/{n_subsets}: k={k}/{d} components, AUC={auc_i:.4f}")
+
+	subset_matrix = np.vstack(subset_scores)  # (n_subsets, n_samples)
+
+	agg_sum = subset_matrix.sum(axis=0)
+
+	agg_max = subset_matrix.max(axis=0)
+
+	# AOM (Average of Maximum): bundle subsets into a handful of groups,
+	# take the max within each group, then average across groups - a
+	# middle ground between Sum (dilutes a signal only strong in a few
+	# subsets) and Max (no dilution but sensitive to single-subset noise)
+	n_groups = min(5, n_subsets)
+	groups = np.array_split(subset_matrix, n_groups, axis=0)
+	agg_aom = np.mean([g.max(axis=0) for g in groups], axis=0)
+
+	return {
+		"no_bagging": base_auc,
+		"bagging_sum": roc_auc_score(y_true, agg_sum),
+		"bagging_max": roc_auc_score(y_true, agg_max),
+		"bagging_aom": roc_auc_score(y_true, agg_aom),
+	}
+
+
+def feature_bagging_comparison(X_train, train_labels, args):
+	# Runs feature_bagging_metrics separately for each of FEATURE_BAGGING_METHODS
+	# (no mixing of method and subspace across methods), prints per-method
+	# results plus a summary table (methods x {no_bagging, sum, max, aom}).
+	print("="*60)
+	print(f"FEATURE BAGGING: {', '.join(FEATURE_BAGGING_METHODS)}")
+	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
+	      f"n_subsets={args.n_subsets})")
+	print("="*60 + "\n")
+
+	rows = {}
+	for method in FEATURE_BAGGING_METHODS:
+		print("#" * 60)
+		print(f"# METHOD: {method}")
+		print("#" * 60)
+		rows[method] = feature_bagging_metrics(
+			X_train, train_labels, args, method, n_subsets=args.n_subsets,
+		)
+		print()
+
+	summary = pd.DataFrame(rows).T
+	summary.index.name = "method"
+
+	print("=" * 60)
+	print("FEATURE BAGGING SUMMARY (AUC, full-train post-hoc)")
+	print("no_bagging = single model on all components (Step A baseline)")
+	print("=" * 60)
+	print(summary.round(4).to_string())
+	print("=" * 60 + "\n")
+
+
 def print_eval_metrics(metrics, label):
 	print("=" * 60)
 	print(f"INTERNAL METRICS CHECK ({label})")
@@ -654,6 +767,14 @@ def main():
 	                          f"with identical reduce/n_components/scale settings, print the "
 	                          f"per-repeat AUC matrix to the terminal (no file written), "
 	                          f"then exit. Overrides --method and --eval-strategy.")
+	parser.add_argument("--feature-bagging", action="store_true",
+	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
+	                          f"fit --n-subsets models on random feature subsets of the "
+	                          f"reduced space, compare no_bagging vs sum/max/aom aggregation "
+	                          f"(full-train post-hoc AUC, not repeated_subsampling - see "
+	                          f"chat notes on cost). Overrides --method/--compare-methods.")
+	parser.add_argument("--n-subsets", type=int, default=10,
+	                     help="Number of random feature subsets per method for --feature-bagging")
 	parser.add_argument("--n-estimators", type=int, default=200,
 	                     help="Number of trees in the Isolation Forest")
 	parser.add_argument("--random-state", type=int, default=42)
@@ -700,6 +821,10 @@ def main():
 		n_active = (train_labels == "active").sum()
 		print(f"Subsampled train_set to {len(X_train):,} rows for quick testing "
 		      f"(active: {n_active} - metrics below are NOT meaningful, runtime check only)\n")
+
+	if args.feature_bagging:
+		feature_bagging_comparison(X_train, train_labels, args)
+		return
 
 	if args.compare_methods:
 		compare_methods(X_train, train_labels, args)
