@@ -7,12 +7,22 @@ Pipeline Steps:
 2. Fit an unsupervised sklearn Pipeline on train_set features only (no labels)
    - scale step (optional): StandardScaler, fit on train fold / full train only
    - reduction step (optional): PCA, Random Projection, etc.
-   - detector step: Isolation Forest, LOF, or GMD+LOF ensemble
+   - detector step: Isolation Forest, LOF, COF, KNN, OCSVM, Fast-ABOD, or GMD+LOF ensemble
 3. Score train_set and test_set
-4. Internal metrics check (train_set only, 3-fold stratified CV): AUC and MCC as mean ± std
+4. Internal metrics check (train_set only), via --eval-strategy:
+   - cv (default, unchanged from before): 3-fold stratified CV
+   - repeated_subsampling (new, Week 3 Folie 7): 80% of inliers train,
+     remaining inliers + 80% of outliers val, repeated --n-repeats times,
+     inlier-only fit
+   Both report AUC and MCC as mean +/- std.
 5. Save test_set scores as team2_prediction.csv
 
-Requires for --method gmd_lof: pip install gmd
+Method comparison (--compare-methods): runs all 6 Week 3 OCC methods
+through repeated_subsampling (always, regardless of --eval-strategy),
+prints the per-repeat AUC matrix to the terminal (no file written) -
+this is the input for next week's Friedman/Conover-Iman test, just copy
+it from the terminal.
+
 """
 
 import argparse
@@ -30,8 +40,11 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.random_projection import GaussianRandomProjection
+from sklearn.svm import OneClassSVM
 
 from mrmr_ifs import MRMRIFSSelector
+
+COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod"]
 
 
 def load_data():
@@ -107,6 +120,23 @@ class GMDLOFEnsemble(BaseEstimator):
 		return scores
 
 
+class PyODAdapter(BaseEstimator):
+	# Wraps a PyOD detector so it exposes score_samples() like sklearn does
+	# (higher = more normal). PyOD's own convention is the opposite
+	# (decision_function: higher = more anomalous), so we flip the sign
+	# here once - anomaly_scores() below flips it back for every method
+	# uniformly, no special-casing needed downstream.
+	def __init__(self, model):
+		self.model = model
+
+	def fit(self, X, y=None):
+		self.model.fit(np.asarray(X))
+		return self
+
+	def score_samples(self, X):
+		return -self.model.decision_function(np.asarray(X))
+
+
 def make_detector(method, n_estimators, random_state, max_subspaces):
 	if method == "isolation_forest":
 		return IsolationForest(
@@ -118,6 +148,25 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 		return LocalOutlierFactor(novelty=True, n_jobs=-1)
 	if method == "gmd_lof":
 		return GMDLOFEnsemble(max_subspaces=max_subspaces, random_state=random_state)
+	if method == "cof":
+		from pyod.models.cof import COF
+		return PyODAdapter(COF(n_neighbors=20))
+	if method == "knn":
+		from pyod.models.knn import KNN
+		return PyODAdapter(KNN(n_neighbors=20, method="largest", n_jobs=-1))
+	if method == "ocsvm":
+		# nu = upper bound on the fraction of training points allowed to be
+		# support vectors / margin errors, roughly analogous to sklearn's
+		# `contamination` elsewhere in this pipeline. 0.05 is a deliberately
+		# loose cap, not the true ~0.2% contamination - OCSVM tends to need
+		# a nu comfortably above the true outlier fraction to fit a stable
+		# boundary at all; worth sweeping later if OCSVM makes the Top-3.
+		return OneClassSVM(kernel="rbf", nu=0.05)
+	if method == "abod":
+		from pyod.models.abod import ABOD
+		# method="fast" = neighbor-based approximation (naive ABOD is
+		# O(n^3), infeasible at ~20k train rows)
+		return PyODAdapter(ABOD(n_neighbors=10, method="fast"))
 	raise ValueError(f"Unknown method: {method}")
 
 
@@ -203,18 +252,26 @@ def log_reduction(pipeline, input_shape, reduce, n_train=None):
 	print("="*60 + "\n")
 
 
+_DETECTOR_LABELS = {
+	"isolation_forest": "FITTING ISOLATION FOREST",
+	"lof": "FITTING LOF (single model, no subspace ensemble)",
+	"cof": "FITTING COF (PyOD, n_neighbors=20)",
+	"knn": "FITTING KNN (PyOD, n_neighbors=20)",
+	"ocsvm": "FITTING ONE-CLASS SVM (sklearn, rbf kernel)",
+	"abod": "FITTING FAST-ABOD (PyOD, n_neighbors=10)",
+}
+
+
 def log_detector_fit(pipeline, method, n_train, elapsed):
 	print("="*60)
-	if method == "isolation_forest":
-		print("FITTING ISOLATION FOREST")
-	elif method == "lof":
-		print("FITTING LOF (single model, no subspace ensemble)")
-	elif method == "gmd_lof":
+	if method == "gmd_lof":
 		detector = pipeline.named_steps["detector"]
 		print("FITTING GMD + LOF (subspace ensemble)")
 		print(f"GMD found {detector.n_subspaces_found_} subspaces "
 		      f"(using {len(detector.subspace_items_)})")
 		elapsed = detector.fit_time_
+	else:
+		print(_DETECTOR_LABELS.get(method, f"FITTING {method.upper()}"))
 	print("="*60)
 	print(f"Fitted on {n_train:,} samples in {elapsed:.1f}s")
 	print("="*60 + "\n")
@@ -343,6 +400,8 @@ def evaluate_full_train_metrics(X_train, train_labels, args):
 
 
 def cross_validate_train_metrics(X_train, train_labels, args, n_splits=3):
+	# Unchanged from before - k-fold stratified CV, fits on the full train
+	# fold (including known actives, contamination-robust fit assumption).
 	y = np.asarray(train_labels == "active", dtype=int)
 	skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=args.random_state)
 	fold_aucs, fold_mccs = [], []
@@ -388,18 +447,97 @@ def cross_validate_train_metrics(X_train, train_labels, args, n_splits=3):
 		"auc_std": auc_std,
 		"mcc": mcc_mean,
 		"mcc_std": mcc_std,
-		"fold_aucs": fold_aucs,
-		"fold_mccs": fold_mccs,
-		"n_splits": n_splits,
+		"repeat_aucs": fold_aucs,   # same key name as repeated_subsampling below, so
+		"repeat_mccs": fold_mccs,   # downstream code doesn't need to branch on strategy
+		"n_repeats": n_splits,
 	}
 
 
-def print_cv_train_metrics(metrics, n_splits, smote=False):
-	suffix = ""
-	if smote:
-		suffix = ", SMOTE on train fold"
+def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=25,
+                                         inlier_frac=0.8, outlier_frac=0.8, verbose=True):
+	# New, added alongside cross_validate_train_metrics (not a replacement).
+	# Slide 7 (Week 3): sample 80% of inliers for training; combine the
+	# remaining 20% inliers with a random 80% sample of outliers as the
+	# validation split; repeat many times. Training uses ONLY inliers, no
+	# labels passed into fit anywhere - pure OCC framing as on that slide.
+	# This differs from cross_validate_train_metrics, which fits on the
+	# full train fold (including known actives).
+	if getattr(args, "feature_select", None) or getattr(args, "smote", False):
+		raise ValueError(
+			"repeated_subsampling doesn't support --feature-select/--smote "
+			"(those need labeled data passed into fit differently) - use "
+			"--eval-strategy cv for those instead."
+		)
+
+	y = np.asarray(train_labels == "active", dtype=int)
+	inlier_idx_all = np.where(y == 0)[0]
+	outlier_idx_all = np.where(y == 1)[0]
+
+	repeat_aucs, repeat_mccs = [], []
+
+	for i in range(n_repeats):
+		rng = np.random.default_rng(args.random_state + i)
+
+		perm_in = rng.permutation(inlier_idx_all)
+		n_train_in = int(round(inlier_frac * len(inlier_idx_all)))
+		train_idx = perm_in[:n_train_in]
+		remaining_in = perm_in[n_train_in:]
+
+		perm_out = rng.permutation(outlier_idx_all)
+		n_val_out = int(round(outlier_frac * len(outlier_idx_all)))
+		val_out = perm_out[:n_val_out]
+
+		val_idx = np.concatenate([remaining_in, val_out])
+
+		X_tr = X_train.iloc[train_idx]
+		X_val = X_train.iloc[val_idx]
+		y_val = y[val_idx]
+
+		pipeline = build_pipeline(
+			reduce=args.reduce,
+			method=args.method,
+			n_components=args.n_components,
+			n_estimators=args.n_estimators,
+			random_state=args.random_state,
+			max_subspaces=args.max_subspaces,
+			scale=args.scale,
+			feature_select=None,
+		)
+		pipeline.fit(X_tr)  # inlier-only fit, no labels passed anywhere
+		scores_val = anomaly_scores(pipeline, X_val)
+
+		if y_val.sum() == 0 or y_val.sum() == len(y_val):
+			if verbose:
+				print(f"  repeat {i+1}/{n_repeats}: skipped (val split has a single class)")
+			continue
+
+		auc = roc_auc_score(y_val, scores_val)
+		_, mcc = _best_mcc_threshold(y_val, scores_val)
+		repeat_aucs.append(auc)
+		repeat_mccs.append(mcc)
+		if verbose:
+			print(f"  repeat {i+1}/{n_repeats}: AUC={auc:.4f}  MCC={mcc:.4f}  "
+			      f"(train={len(train_idx)}, val={len(val_idx)}, val_active={int(y_val.sum())})")
+
+	if not repeat_aucs:
+		raise ValueError("Repeated subsampling produced no valid repeats")
+
+	auc_mean, auc_std = np.mean(repeat_aucs), np.std(repeat_aucs, ddof=1)
+	mcc_mean, mcc_std = np.mean(repeat_mccs), np.std(repeat_mccs, ddof=1)
+	return {
+		"auc": auc_mean,
+		"auc_std": auc_std,
+		"mcc": mcc_mean,
+		"mcc_std": mcc_std,
+		"repeat_aucs": repeat_aucs,
+		"repeat_mccs": repeat_mccs,
+		"n_repeats": len(repeat_aucs),
+	}
+
+
+def print_eval_metrics(metrics, label):
 	print("=" * 60)
-	print(f"INTERNAL METRICS CHECK ({n_splits}-fold stratified CV on train{suffix})")
+	print(f"INTERNAL METRICS CHECK ({label})")
 	print("=" * 60)
 	print(f"AUC: {metrics['auc']:.4f} +/- {metrics['auc_std']:.4f}")
 	print(f"MCC: {metrics['mcc']:.4f} +/- {metrics['mcc_std']:.4f}")
@@ -420,10 +558,21 @@ def save_prediction(test_scores, test_ids, path="outputs/team2_prediction.csv"):
 
 
 def run_pipeline(X_train, X_test, train_labels, test_ids, args, save=True):
-	cv_metrics = cross_validate_train_metrics(
-		X_train, train_labels, args, n_splits=args.cv_folds,
-	)
-	print_cv_train_metrics(cv_metrics, args.cv_folds, smote=getattr(args, "smote", False))
+	if getattr(args, "eval_strategy", "cv") == "repeated_subsampling":
+		eval_metrics = repeated_random_subsampling_metrics(
+			X_train, train_labels, args, n_repeats=args.n_repeats,
+		)
+		print_eval_metrics(
+			eval_metrics,
+			f"{eval_metrics['n_repeats']}x repeated random subsampling on train, "
+			f"inlier-only fit",
+		)
+	else:
+		eval_metrics = cross_validate_train_metrics(
+			X_train, train_labels, args, n_splits=args.cv_folds,
+		)
+		suffix = ", SMOTE on train fold" if getattr(args, "smote", False) else ""
+		print_eval_metrics(eval_metrics, f"{args.cv_folds}-fold stratified CV on train{suffix}")
 
 	pipeline = build_pipeline(
 		reduce=args.reduce,
@@ -443,29 +592,94 @@ def run_pipeline(X_train, X_test, train_labels, test_ids, args, save=True):
 
 	if save:
 		save_prediction(test_scores, test_ids)
-	return cv_metrics
+	return eval_metrics
+
+
+def compare_methods(X_train, train_labels, args):
+	# Runs COMPARE_METHODS through repeated_random_subsampling_metrics with
+	# identical reduce/n_components/scale settings (fair comparison, same
+	# feature space for every method), prints the per-repeat AUC matrix to
+	# the terminal. Always uses repeated_subsampling regardless of
+	# --eval-strategy - this comparison mode is separate from the single-
+	# method CV/repeated_subsampling choice above. Nothing is written to
+	# disk - copy the printed table for the Friedman/Conover-Iman test
+	# next week.
+	print("="*60)
+	print(f"COMPARING METHODS: {', '.join(COMPARE_METHODS)}")
+	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
+	      f"n_repeats={args.n_repeats})")
+	print("="*60 + "\n")
+
+	results = {}
+	for method in COMPARE_METHODS:
+		print("#" * 60)
+		print(f"# METHOD: {method}")
+		print("#" * 60)
+
+		method_args = argparse.Namespace(**{**vars(args), "method": method,
+		                                     "feature_select": None, "smote": False})
+		metrics = repeated_random_subsampling_metrics(
+			X_train, train_labels, method_args, n_repeats=args.n_repeats, verbose=False,
+		)
+		results[method] = metrics["repeat_aucs"]
+		print(f"AUC: {metrics['auc']:.4f} +/- {metrics['auc_std']:.4f}  "
+		      f"({metrics['n_repeats']} valid repeats)\n")
+
+	min_len = min(len(v) for v in results.values())
+	if any(len(v) != min_len for v in results.values()):
+		print(f"WARNING: methods had different numbers of valid repeats, "
+		      f"truncating all to {min_len} for the matrix.\n")
+
+	matrix = pd.DataFrame({m: v[:min_len] for m, v in results.items()})
+	matrix.index.name = "repeat"
+
+	print("=" * 60)
+	print(f"AUC MATRIX ({matrix.shape[0]} repeats x {matrix.shape[1]} methods)")
+	print("copy this for next week's Friedman/Conover-Iman test")
+	print("=" * 60)
+	print(matrix.round(4).to_string())
+	print()
+	print("Mean +/- Std per method:")
+	print((matrix.mean().round(4).astype(str) + " +/- " + matrix.std(ddof=1).round(4).astype(str)).to_string())
+	print("=" * 60 + "\n")
 
 
 def main():
 	parser = argparse.ArgumentParser(description="p53 Outlier Detection Pipeline")
 	parser.add_argument("--method", type=str, default="isolation_forest",
-	                     choices=["isolation_forest", "lof", "gmd_lof"],
+	                     choices=["isolation_forest", "lof", "gmd_lof", "cof", "knn", "ocsvm", "abod"],
 	                     help="Outlier detection method")
+	parser.add_argument("--compare-methods", action="store_true",
+	                     help=f"Run all of {COMPARE_METHODS} through repeated_subsampling "
+	                          f"with identical reduce/n_components/scale settings, print the "
+	                          f"per-repeat AUC matrix to the terminal (no file written), "
+	                          f"then exit. Overrides --method and --eval-strategy.")
 	parser.add_argument("--n-estimators", type=int, default=200,
 	                     help="Number of trees in the Isolation Forest")
 	parser.add_argument("--random-state", type=int, default=42)
+	parser.add_argument("--eval-strategy", type=str, default="cv",
+	                     choices=["cv", "repeated_subsampling"],
+	                     help="cv = stratified k-fold, unchanged from before (default); "
+	                          "repeated_subsampling = new Folie 7 Week 3 approach (80%% "
+	                          "inliers train, remaining inliers + 80%% outliers val, "
+	                          "repeated). Only applies to single --method runs, not "
+	                          "--compare-methods (which always uses repeated_subsampling).")
 	parser.add_argument("--cv-folds", type=int, default=3,
-	                     help="K-fold CV on train for internal AUC/MCC (mean ± std)")
+	                     help="K-fold CV on train for internal AUC/MCC (--eval-strategy cv)")
+	parser.add_argument("--n-repeats", type=int, default=25,
+	                     help="Repeats for --eval-strategy repeated_subsampling / --compare-methods")
 	parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True,
 	                     help="StandardScaler before reduction (fit on train fold in CV, full train for final model)")
 	parser.add_argument("--smote", action=argparse.BooleanOptionalAction, default=False,
-	                     help="SMOTE on train fold only (after scale, before reduce/detector; uses labels on train)")
+	                     help="SMOTE on train fold only (after scale, before reduce/detector; "
+	                          "uses labels on train). --eval-strategy cv only.")
 	parser.add_argument("--reduce", type=str, default="none",
 	                     choices=["none", "pca", "random_projection", "truncated_svd", "isomap", "umap"],
 	                     help="Dimensionality reduction before fitting")
 	parser.add_argument("--feature-select", type=str, default=None,
 	                     choices=["mrmr_ifs"],
-	                     help="Supervised feature selection before detector (uses labels on train only)")
+	                     help="Supervised feature selection before detector (uses labels on "
+	                          "train only). --eval-strategy cv only.")
 	parser.add_argument("--n-components", type=int, default=147,
 	                     help="Components for --reduce (147 = W1 PCA result, 95%% variance)")
 	parser.add_argument("--sample", type=int, default=None,
@@ -486,6 +700,10 @@ def main():
 		n_active = (train_labels == "active").sum()
 		print(f"Subsampled train_set to {len(X_train):,} rows for quick testing "
 		      f"(active: {n_active} - metrics below are NOT meaningful, runtime check only)\n")
+
+	if args.compare_methods:
+		compare_methods(X_train, train_labels, args)
+		return
 
 	if args.sweep:
 		k_values = [int(k) for k in args.sweep.split(",")]
