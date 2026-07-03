@@ -23,7 +23,10 @@ COMPARE_METHODS through repeated_subsampling (always, regardless of
 file written) - this is the input for next week's Friedman/Conover-Iman
 test, just copy it from the terminal.
 
-
+COF is excluded from COMPARE_METHODS - PyOD's implementation is too slow
+at ~20k train rows per repeat (near-O(n^2) pairwise connectivity), a
+single --compare-methods run never finished. --method cof still works
+for a one-off single run if needed.
 """
 
 import argparse
@@ -475,7 +478,7 @@ def cross_validate_train_metrics(X_train, train_labels, args, n_splits=3):
 def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=25,
                                          inlier_frac=0.8, outlier_frac=0.8, verbose=True):
 	# New, added alongside cross_validate_train_metrics (not a replacement).
-	# Slide 7 (Week 3): sample 80% of inliers for training; combine the
+	# Folie 7 (Week 3): sample 80% of inliers for training; combine the
 	# remaining 20% inliers with a random 80% sample of outliers as the
 	# validation split; repeat many times. Training uses ONLY inliers, no
 	# labels passed into fit anywhere - pure OCC framing as on that slide.
@@ -648,6 +651,85 @@ def feature_bagging_comparison(X_train, train_labels, args):
 	print("=" * 60 + "\n")
 
 
+def heterogeneous_ensemble_metrics(X_train, train_labels, args, methods, verbose=True):
+	# Step C (Week 3 plan): opposite of Step B - SAME full feature space for
+	# every method (no subspace split), diversity comes from the methods
+	# themselves instead of from feature subsets. Mixing method AND subspace
+	# would confound which one causes a result (see chat notes) - that's
+	# exactly what this avoids.
+	X_red = fit_scale_reduce(X_train, args.reduce, args.n_components, args.random_state, args.scale)
+	y_true = np.asarray(train_labels == "active", dtype=int)
+
+	method_scores = {}
+	for method in methods:
+		detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
+		detector.fit(X_red)
+		scores = -detector.score_samples(X_red)
+		auc = roc_auc_score(y_true, scores)
+		method_scores[method] = scores
+		if verbose:
+			print(f"  {method}: AUC={auc:.4f}")
+
+	# z-normalize before combining - methods are on completely different
+	# scales (IF ~[-0.6,0.6], KNN distances, OCSVM signed margin, ...),
+	# combining raw scores would just favor whichever method has the
+	# largest numbers, same reasoning as Step B
+	scores_z = {m: (s - s.mean()) / (s.std() + 1e-12) for m, s in method_scores.items()}
+	stacked = np.vstack(list(scores_z.values()))  # (n_methods, n_samples)
+
+	agg_sum = stacked.sum(axis=0)
+	agg_max = stacked.max(axis=0)
+
+	if verbose:
+		dominant_idx = np.argmax(stacked, axis=0)
+		method_names = list(scores_z.keys())
+		dominance = pd.Series(dominant_idx).map(lambda i: method_names[i]).value_counts(normalize=True)
+		print(f"  which method has the highest z-score, per sample (dominance in --max): "
+		      f"{dict(dominance.round(3))}")
+	# AOM doesn't apply meaningfully with only 3 "subsets" (=methods) here -
+	# group size would be 1, i.e. identical to max. Use rank-averaging
+	# instead as the third combination rule, common for heterogeneous
+	# ensembles (see chat notes on Step C).
+	# pd.Series.rank() assigns ascending ranks (1=smallest value). Since
+	# scores_z is already in "higher = more anomalous" convention, a higher
+	# rank number already means more anomalous too - no sign flip needed
+	# here, unlike a naive reading might suggest.
+	ranks = np.vstack([pd.Series(s).rank().values for s in scores_z.values()])
+	agg_rank = ranks.mean(axis=0)
+
+	individual_aucs = {m: roc_auc_score(y_true, s) for m, s in method_scores.items()}
+	return {
+		**individual_aucs,
+		"ensemble_sum": roc_auc_score(y_true, agg_sum),
+		"ensemble_max": roc_auc_score(y_true, agg_max),
+		"ensemble_rank_avg": roc_auc_score(y_true, agg_rank),
+	}
+
+
+def heterogeneous_ensemble_comparison(X_train, train_labels, args):
+	# Runs FEATURE_BAGGING_METHODS (same Top-3 as Step B) all on the same
+	# full reduced feature space, combines via sum/max/rank-averaging,
+	# prints individual method AUCs plus the three ensemble variants.
+	print("="*60)
+	print(f"HETEROGENEOUS ENSEMBLE: {', '.join(FEATURE_BAGGING_METHODS)}")
+	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
+	      f"same feature space for all methods)")
+	print("="*60 + "\n")
+
+	results = heterogeneous_ensemble_metrics(X_train, train_labels, args, FEATURE_BAGGING_METHODS)
+
+	print("\n" + "=" * 60)
+	print("HETEROGENEOUS ENSEMBLE SUMMARY (AUC, full-train post-hoc)")
+	print("=" * 60)
+	for method in FEATURE_BAGGING_METHODS:
+		print(f"  {method:<20} {results[method]:.4f}")
+	print("  " + "-" * 30)
+	print(f"  {'ensemble (sum)':<20} {results['ensemble_sum']:.4f}")
+	print(f"  {'ensemble (max)':<20} {results['ensemble_max']:.4f}")
+	print(f"  {'ensemble (rank avg)':<20} {results['ensemble_rank_avg']:.4f}")
+	print("=" * 60 + "\n")
+
+
 def print_eval_metrics(metrics, label):
 	print("=" * 60)
 	print(f"INTERNAL METRICS CHECK ({label})")
@@ -775,6 +857,11 @@ def main():
 	                          f"chat notes on cost). Overrides --method/--compare-methods.")
 	parser.add_argument("--n-subsets", type=int, default=10,
 	                     help="Number of random feature subsets per method for --feature-bagging")
+	parser.add_argument("--heterogeneous-ensemble", action="store_true",
+	                     help=f"Step C: {FEATURE_BAGGING_METHODS} on the SAME full feature "
+	                          f"space (no subspace split, opposite of --feature-bagging), "
+	                          f"scores z-normalized and combined via sum/max/rank-averaging. "
+	                          f"Overrides --method/--compare-methods/--feature-bagging.")
 	parser.add_argument("--n-estimators", type=int, default=200,
 	                     help="Number of trees in the Isolation Forest")
 	parser.add_argument("--random-state", type=int, default=42)
@@ -821,6 +908,10 @@ def main():
 		n_active = (train_labels == "active").sum()
 		print(f"Subsampled train_set to {len(X_train):,} rows for quick testing "
 		      f"(active: {n_active} - metrics below are NOT meaningful, runtime check only)\n")
+
+	if args.heterogeneous_ensemble:
+		heterogeneous_ensemble_comparison(X_train, train_labels, args)
+		return
 
 	if args.feature_bagging:
 		feature_bagging_comparison(X_train, train_labels, args)
