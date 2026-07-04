@@ -244,7 +244,7 @@ single-method runs.)
 
 ### Step A — comparing OCC methods across all three families
 
-Course slides group OD methods into three families: **locality-based**
+OD methods are grouped into three families: **locality-based**
 (LOF, KNN), **cluster-based** (OCSVM), **subspace-based**
 (ABOD, Isolation Forest). Isolation Forest, KNN, OCSVM, ABOD (fast), and
 LOF were compared with repeated subsampling (25 repeats) on PCA (147) +
@@ -329,3 +329,15 @@ Reproduce:
 ```bash
 python p53_od_pipeline.py --heterogeneous-ensemble --reduce pca --n-components 147
 ```
+
+### Best result this week
+
+**Isolation Forest + Feature Bagging (Max aggregation): AUC 0.7354**
+(full-train post-hoc, Step B) — the highest score across every
+configuration tested in Week 3, ahead of any single method alone (Step
+A) and ahead of the heterogeneous ensemble (Step C, which underperformed
+the best single method). Note this number uses a different evaluation
+convention (full-train post-hoc) than Step A's repeated-subsampling
+numbers, so it is a "best across setups" statement rather than a single
+directly-comparable ranking — see the per-section notes above for how
+each number was produced.
