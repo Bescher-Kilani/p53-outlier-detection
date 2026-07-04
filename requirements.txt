@@ -4,3 +4,4 @@ seaborn
 scikit-learn
 umap-learn
 imbalanced-learn
+pyod

@@ -25,6 +25,9 @@ p53mutant/
 ├── p53_od_pipeline.py         # outlier detection pipeline (the deliverable)
 ├── eval_internal_test_auc.py  # our own check of the final prediction (not part of the pipeline)
 ├── compute_correlations.py    # Pearson/Spearman/MI via BLAS matmul, run on the KIT server
+├── mrmr_ifs.py                # mRMR+IFS feature selector (Week 2, exploratory, see below)
+├── pca_2d_3d_blocks.py        # separate PCA on 2D/3D feature blocks (Week 3, see below)
+├── pca_2d_3d_blocks_cv.py     # CV check for the block-PCA representation (Week 3)
 └── notbooks/
     └── data_expolartion.ipynb # exploration & correlation/PCA plots only,
                                 # not required to run the pipeline
@@ -76,9 +79,7 @@ source venv/bin/activate
    python p53_od_pipeline.py --method isolation_forest --reduce pca
    ```
    Produces `outputs/team2_prediction.csv`. Run with `--help` to see all
-   options (`--method isolation_forest|lof|gmd_lof`, `--reduce
-   none|pca|random_projection|truncated_svd|isomap|umap`, `--sweep` to
-   compare several `--n-components` values for one method in a single run).
+   options.
 4. Check the prediction against the internal test labels (our own
    sanity check, separate from the pipeline):
    ```bash
@@ -175,32 +176,156 @@ Not required to reproduce the pipeline above.
   | 2 | Isolation Forest + PCA (147) + StandardScaler | **0.7291 ± 0.0543** | fully unsupervised fit |
   | 3 | GMD + LOF + Random Projection (147) + SMOTE | 0.8930 ± 0.0389 | labels via SMOTE; treat as exploratory |
 
-  **Reproduce internal CV scores** (train only, no test prediction):
+## Week 3 — key findings
 
-  ```bash
-  # Best overall (mRMR + IFS, no scaling — matches 0.7511 CV)
-  python benchmark_mrmr_ifs.py --step cv
+Focus of the week (per course slides "Method Selection"): how to fairly
+compare several OCC methods under extreme imbalance (61 active out of
+30,754, ~503:1), and whether ensembling helps. Reference point going in:
+Isolation Forest + PCA (147) + StandardScaler, CV AUC 0.7291 (Week 2's
+only fully OCC-compliant result) — the label-contaminated mRMR/GMD+SMOTE
+results were not used further. Everything below (new eval strategy, new
+methods, feature bagging, heterogeneous ensemble) is new work this week.
 
-  # Best fully unsupervised (PCA + norm — matches 0.7291 CV)
-  python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 147 --scale
-  # (CV only, no test prediction: python benchmark_week2_cv.py --only pca)
+### 2D/3D block-separated PCA
 
-  # GMD + LOF + Random Projection + SMOTE (matches 0.8930 CV; needs gmd)
-  python benchmark_gmd_lof_cv.py --only rp_smote
-  ```
+PCA separately on the 2D (electrostatic/surface) and 3D (distance-based)
+blocks, then relate them — instead of the single PCA over all 5,408
+mixed columns used elsewhere.
 
-  **Produce `outputs/team2_prediction.csv`** (fit on full train, then score test):
+Two-stage (`pca_2d_3d_blocks.py`): PCA per block to 95% variance,
+concatenate, PCA again to 95% variance:
 
-  ```bash
-  # Recommended deliverable: best CV under strict OCC (no labels in fit)
-  python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 147 --scale
+| Stage | Raw dimensions | Components for 95% variance |
+|-------|---------------|------------------------------|
+| 2D block | 4,826 | 145 |
+| 3D block | 582 | 148 |
+| Concatenated (293) → stage 2 | 293 | **62** |
 
-  # Best CV overall (uses labels for mRMR/IFS on train only)
-  python p53_od_pipeline.py --method isolation_forest --reduce none --no-scale --feature-select mrmr_ifs
+293→62 compression means the 2D and 3D components strongly co-vary —
+consistent with both blocks coming from the same underlying 3D
+structural model (surface charge and distance displacement as two views
+of the same structural change).
 
-  # GMD exploratory (labels via SMOTE; requires gmd)
-  python p53_od_pipeline.py --method gmd_lof --reduce random_projection --n-components 147 --scale --smote
-  ```
+CV check with Isolation Forest on the 62-dim. result
+(`pca_2d_3d_blocks_cv.py`):
 
-  Each `p53_od_pipeline.py` run prints 3-fold stratified CV on train, then fits
-  on all train and writes test scores. Check with `python eval_internal_test_auc.py`.
+| Setup | CV AUC |
+|-------|--------|
+| Baseline: single PCA (147 comp.) + Scaler | 0.7291 ± 0.0543 |
+| 2D/3D block-separated PCA + stage 2 (62 comp.) + Scaler | 0.7156 ± 0.0674 |
+
+No improvement — difference within CV noise. There is a measurable
+relation between the blocks (293→62 compression), but exploiting it this
+way doesn't improve detection. Single-stage 147-component PCA remains
+the baseline reduction used throughout.
+
+### Evaluation strategy: repeated random subsampling
+
+3-fold CV leaves only ~16 active cases per validation fold — too few for
+a stable AUC estimate (this is explicitly called out on the course
+slides). Instead, Week 3 introduces **repeated random subsampling**:
+sample 80% of inliers for training, combine the remaining 20% inliers
+with an 80% sample of outliers as validation, repeat many times,
+average. Unlike our Week 2 CV, this trains **only on inliers** (no known
+actives in `.fit()` at all) — the strict OCC framing from the slides.
+
+**25 repeats:** tested 25 vs. 100 for Isolation Forest — 0.7248 ± 0.0227
+vs. 0.7292 ± 0.0215, negligible difference for 4x the compute. Kept as
+default; per-repeat results stored (not just mean/std) for next week's
+Friedman/Conover-Iman test.
+
+New pipeline command:
+```bash
+python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 147 \
+    --eval-strategy repeated_subsampling --n-repeats 25
+```
+(`--eval-strategy cv`, unchanged from Week 2, remains the default for
+single-method runs.)
+
+### Step A — comparing OCC methods across all three families
+
+Course slides group OD methods into three families: **locality-based**
+(LOF, KNN), **cluster-based** (OCSVM), **subspace-based**
+(ABOD, Isolation Forest). Isolation Forest, KNN, OCSVM, ABOD (fast), and
+LOF were compared with repeated subsampling (25 repeats) on PCA (147) +
+StandardScaler:
+
+| Method | AUC | Family |
+|--------|-----|--------|
+| Isolation Forest | **0.7248 ± 0.0227** | Subspace-based |
+| KNN | 0.6997 ± 0.0205 | Locality-based |
+| OCSVM | 0.6860 ± 0.0175 | Cluster-based |
+| ABOD (fast) | 0.6494 ± 0.0195 | Subspace-based |
+| LOF | 0.5067 ± 0.0227 | Locality-based |
+
+
+LOF (AUC≈0.51, near-random) vs. KNN (0.70) despite same family, same
+`n_neighbors=20` — LOF's local density-ratio computation appears
+specifically weak on this PCA-reduced space, not a family-level issue.
+
+**Top-3 carried forward to Steps B/C:** Isolation Forest, KNN, OCSVM.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --compare-methods --reduce pca --n-components 147 --n-repeats 25
+```
+Prints the full 25×5 per-repeat AUC matrix to the terminal (not saved) —
+input for next week's Friedman/Conover-Iman test.
+
+### Step B — feature bagging (per method, no method mixing)
+
+Per Top-3 method separately: 10 models on random feature subsets
+(uniform size 74–147 of 147 PCA components); each subset's scores are
+z-normalized (different subsets can land on different scales even with
+the same detector), then combined via Sum, Max, AOM. Single full-train
+post-hoc AUC (not nested in the 25-repeat subsampling — too expensive at
+this data size); confirmed stable at 100 subsets.
+
+| Method | No bagging | Sum | Max | AOM |
+|--------|-----------|-----|-----|-----|
+| Isolation Forest | 0.7279 | 0.7335 | **0.7354** | 0.7344 |
+| KNN | 0.6816 | **0.6861** | 0.6834 | 0.6852 |
+| OCSVM | 0.6891 | 0.6990 | **0.7012** | 0.6945 |
+
+Small but consistent gain across all three methods/aggregations
+(+0.5 to +1.2pp). Max wins for IF/OCSVM, Sum for KNN — differences
+between aggregations are small overall.
+
+Dilution effect (seen with GMD in Week 2) barely shows here: these
+subsets are large and overlapping (≥50% of 147 components), unlike
+GMD's small disjoint subspaces, so little signal gets diluted away
+regardless of aggregation.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 --n-subsets 10
+```
+
+### Step C — heterogeneous ensemble (same feature space, different methods)
+
+Opposite of Step B: Top-3 methods fit on the same full 147-dim. space
+(no subspace split — mixing method and subspace would confound which one
+causes a result), scores z-normalized, combined via Sum, Max,
+rank-averaging (AOM doesn't apply meaningfully with only 3 candidates).
+
+| | AUC |
+|---|-----|
+| Isolation Forest (alone) | **0.7279** |
+| OCSVM (alone) | 0.6891 |
+| KNN (alone) | 0.6816 |
+| Ensemble (Sum) | 0.7062 |
+| Ensemble (Max) | 0.7062 |
+| Ensemble (Rank avg) | 0.7048 |
+
+**Negative result:** ensemble (0.7048–0.7062) lands below the best
+single method (Isolation Forest, 0.7279) — behaves like a weighted
+average, not an improvement. KNN/OCSVM appear to be weaker versions of
+the same signal Isolation Forest already captures rather than
+complementary information. Dominance check (highest z-score per sample):
+roughly even 35/35/30% split across methods — no single method
+dominates the combination.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --heterogeneous-ensemble --reduce pca --n-components 147
+```
