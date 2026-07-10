@@ -27,6 +27,16 @@ COF is excluded from COMPARE_METHODS - PyOD's implementation is too slow
 at ~20k train rows per repeat (near-O(n^2) pairwise connectivity), a
 single --compare-methods run never finished. --method cof still works
 for a one-off single run if needed.
+
+Feature bagging (--feature-bagging) and heterogeneous ensemble
+(--heterogeneous-ensemble) now ALSO use full repeated random subsampling
+(same 80/20 inlier/outlier split logic as Step A), not a single full-train
+post-hoc check - this gives a proper mean +/- std instead of one point
+estimate. Cost: --feature-bagging does n_repeats * n_subsets fits PER
+METHOD (e.g. 25 * 10 = 250, times 3 methods = 750 total), and
+--heterogeneous-ensemble does n_repeats fits per method (25 * 3 = 75
+total) - see chat notes on why the two scale so differently (Step B needs
+n_subsets extra fits inside every single repeat, Step C doesn't).
 """
 
 import argparse
@@ -177,19 +187,37 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 	raise ValueError(f"Unknown method: {method}")
 
 
-def fit_scale_reduce(X, reduce, n_components, random_state, scale):
+def fit_scale_reduce(X, reduce, n_components, random_state, scale, return_fitted=False):
 	# Fits scale+reduce once on the full array, separate from build_pipeline
-	# (which bundles reduce+detector together) - needed for Step B feature
-	# bagging, where the SAME reduced feature space is reused across many
-	# detector fits on different column subsets, instead of re-fitting PCA
-	# per subset.
+	# (which bundles reduce+detector together). return_fitted=True additionally
+	# returns the fitted scaler/reducer so a separate val/test set can be
+	# transformed with the exact same fit (no leakage) - used by every
+	# repeated-subsampling variant below (Step A/B/C all need this).
 	X_arr = np.asarray(X, dtype=np.float64)
+	scaler = None
 	if scale:
-		X_arr = StandardScaler().fit_transform(X_arr)
+		scaler = StandardScaler().fit(X_arr)
+		X_arr = scaler.transform(X_arr)
 	reducer = make_reducer(reduce, n_components, random_state)
 	if reducer == "passthrough":
+		X_red = X_arr
+	else:
+		X_red = reducer.fit_transform(X_arr)
+	if return_fitted:
+		return X_red, scaler, reducer
+	return X_red
+
+
+def transform_scale_reduce(X, scaler, reducer):
+	# Applies an already-fitted scaler/reducer pair (from fit_scale_reduce
+	# with return_fitted=True) to a new array - e.g. a val split that must
+	# use the train split's fit, not its own.
+	X_arr = np.asarray(X, dtype=np.float64)
+	if scaler is not None:
+		X_arr = scaler.transform(X_arr)
+	if reducer == "passthrough":
 		return X_arr
-	return reducer.fit_transform(X_arr)
+	return reducer.transform(X_arr)
 
 
 def build_pipeline(reduce, method, n_components=147, n_estimators=200,
@@ -475,15 +503,31 @@ def cross_validate_train_metrics(X_train, train_labels, args, n_splits=3):
 	}
 
 
+def _repeated_split_indices(y, inlier_idx_all, outlier_idx_all, seed, inlier_frac, outlier_frac):
+	# Shared split logic for Step A/B/C repeated subsampling: 80% of inliers
+	# for train, remaining inliers + 80% of outliers for val. Factored out
+	# so all three steps draw splits the exact same way.
+	rng = np.random.default_rng(seed)
+
+	perm_in = rng.permutation(inlier_idx_all)
+	n_train_in = int(round(inlier_frac * len(inlier_idx_all)))
+	train_idx = perm_in[:n_train_in]
+	remaining_in = perm_in[n_train_in:]
+
+	perm_out = rng.permutation(outlier_idx_all)
+	n_val_out = int(round(outlier_frac * len(outlier_idx_all)))
+	val_out = perm_out[:n_val_out]
+
+	val_idx = np.concatenate([remaining_in, val_out])
+	return train_idx, val_idx
+
+
 def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=25,
                                          inlier_frac=0.8, outlier_frac=0.8, verbose=True):
-	# New, added alongside cross_validate_train_metrics (not a replacement).
-	# Folie 7 (Week 3): sample 80% of inliers for training; combine the
-	# remaining 20% inliers with a random 80% sample of outliers as the
+	# Step A. Folie 7 (Week 3): sample 80% of inliers for training; combine
+	# the remaining 20% inliers with a random 80% sample of outliers as the
 	# validation split; repeat many times. Training uses ONLY inliers, no
 	# labels passed into fit anywhere - pure OCC framing as on that slide.
-	# This differs from cross_validate_train_metrics, which fits on the
-	# full train fold (including known actives).
 	if getattr(args, "feature_select", None) or getattr(args, "smote", False):
 		raise ValueError(
 			"repeated_subsampling doesn't support --feature-select/--smote "
@@ -498,18 +542,9 @@ def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=2
 	repeat_aucs, repeat_mccs = [], []
 
 	for i in range(n_repeats):
-		rng = np.random.default_rng(args.random_state + i)
-
-		perm_in = rng.permutation(inlier_idx_all)
-		n_train_in = int(round(inlier_frac * len(inlier_idx_all)))
-		train_idx = perm_in[:n_train_in]
-		remaining_in = perm_in[n_train_in:]
-
-		perm_out = rng.permutation(outlier_idx_all)
-		n_val_out = int(round(outlier_frac * len(outlier_idx_all)))
-		val_out = perm_out[:n_val_out]
-
-		val_idx = np.concatenate([remaining_in, val_out])
+		train_idx, val_idx = _repeated_split_indices(
+			y, inlier_idx_all, outlier_idx_all, args.random_state + i, inlier_frac, outlier_frac,
+		)
 
 		X_tr = X_train.iloc[train_idx]
 		X_val = X_train.iloc[val_idx]
@@ -557,77 +592,110 @@ def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=2
 	}
 
 
-def feature_bagging_metrics(X_train, train_labels, args, method, n_subsets=10,
-                             subset_min_frac=0.5, verbose=True):
-	# Step B (Week 3 plan): SEPARATE per method, no mixing of method and
-	# feature subspace (would confound the two effects - see chat notes).
-	# Single full-train fit-and-score check (post-hoc AUC, same convention
-	# as evaluate_full_train_metrics), NOT nested inside the 25x repeated
-	# subsampling from Step A - nesting would mean n_repeats * n_subsets
-	# fits per method, too expensive at this data size.
-	X_red = fit_scale_reduce(X_train, args.reduce, args.n_components, args.random_state, args.scale)
-	d = X_red.shape[1]
-	y_true = np.asarray(train_labels == "active", dtype=int)
+def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repeats=25,
+                                      n_subsets=10, subset_min_frac=0.5,
+                                      inlier_frac=0.8, outlier_frac=0.8, verbose=True):
+	# Step B, full repeated-subsampling version (see chat notes: this means
+	# n_subsets extra fits INSIDE every single repeat, so total fits per
+	# method = n_repeats * n_subsets, e.g. 25*10=250, x3 methods = 750).
+	# Same 80/20 split logic as Step A; scale+reduce fit on the train split
+	# only, applied to val with the same fit (no leakage). Replaces the old
+	# single full-train post-hoc check - this version gives a proper
+	# mean +/- std across repeats instead of one point estimate.
+	if getattr(args, "feature_select", None) or getattr(args, "smote", False):
+		raise ValueError("feature bagging repeated subsampling doesn't support --feature-select/--smote")
 
-	# baseline: single model on the full reduced space, no bagging
-	base_detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
-	base_detector.fit(X_red)
-	base_scores = -base_detector.score_samples(X_red)
-	base_auc = roc_auc_score(y_true, base_scores)
-	if verbose:
-		print(f"  baseline (no bagging, all {d} components): AUC={base_auc:.4f}")
+	y = np.asarray(train_labels == "active", dtype=int)
+	inlier_idx_all = np.where(y == 0)[0]
+	outlier_idx_all = np.where(y == 1)[0]
 
-	rng = np.random.default_rng(args.random_state)
-	subset_scores = []  # z-normalized score vectors, one per subset
+	repeat_results = {"no_bagging": [], "bagging_sum": [], "bagging_max": [], "bagging_aom": []}
 
-	for i in range(n_subsets):
-		k = int(rng.integers(int(subset_min_frac * d), d + 1))
-		cols = rng.choice(d, size=k, replace=False)
+	for i in range(n_repeats):
+		train_idx, val_idx = _repeated_split_indices(
+			y, inlier_idx_all, outlier_idx_all, args.random_state + i, inlier_frac, outlier_frac,
+		)
 
-		detector = make_detector(method, args.n_estimators, args.random_state + i + 1, args.max_subspaces)
-		detector.fit(X_red[:, cols])
-		scores = -detector.score_samples(X_red[:, cols])
+		X_tr = X_train.iloc[train_idx]
+		X_val = X_train.iloc[val_idx]
+		y_val = y[val_idx]
 
-		# z-normalize before aggregation - subsets aren't on the same scale,
-		# summing/maxing raw scores would just favor whichever subset
-		# happens to produce the largest numbers (see chat notes)
-		scores_z = (scores - scores.mean()) / (scores.std() + 1e-12)
-		subset_scores.append(scores_z)
+		if y_val.sum() == 0 or y_val.sum() == len(y_val):
+			if verbose:
+				print(f"  repeat {i+1}/{n_repeats}: skipped (val split has a single class)")
+			continue
+
+		X_tr_red, scaler, reducer = fit_scale_reduce(
+			X_tr, args.reduce, args.n_components, args.random_state, args.scale,
+			return_fitted=True,
+		)
+		X_val_red = transform_scale_reduce(X_val, scaler, reducer)
+		d = X_tr_red.shape[1]
+
+		# baseline: no bagging, single model on all components, trained on
+		# this repeat's train split, scored on this repeat's val split
+		base_detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
+		base_detector.fit(X_tr_red)
+		base_scores_val = -base_detector.score_samples(X_val_red)
+		repeat_results["no_bagging"].append(roc_auc_score(y_val, base_scores_val))
+
+		rng_subsets = np.random.default_rng(args.random_state)
+		subset_scores_val = []
+		for j in range(n_subsets):
+			k = int(rng_subsets.integers(int(subset_min_frac * d), d + 1))
+			cols = rng_subsets.choice(d, size=k, replace=False)
+
+			detector = make_detector(method, args.n_estimators, args.random_state + j + 1, args.max_subspaces)
+			detector.fit(X_tr_red[:, cols])
+			scores_val = -detector.score_samples(X_val_red[:, cols])
+
+			# z-normalize using this repeat's val scores - subsets aren't on
+			# the same scale, raw summing/maxing would just favor whichever
+			# subset happens to produce the largest numbers
+			scores_val_z = (scores_val - scores_val.mean()) / (scores_val.std() + 1e-12)
+			subset_scores_val.append(scores_val_z)
+
+		subset_matrix = np.vstack(subset_scores_val)  # (n_subsets, n_val)
+		agg_sum = subset_matrix.sum(axis=0)
+		agg_max = subset_matrix.max(axis=0)
+		n_groups = min(5, n_subsets)
+		groups = np.array_split(subset_matrix, n_groups, axis=0)
+		agg_aom = np.mean([g.max(axis=0) for g in groups], axis=0)
+
+		repeat_results["bagging_sum"].append(roc_auc_score(y_val, agg_sum))
+		repeat_results["bagging_max"].append(roc_auc_score(y_val, agg_max))
+		repeat_results["bagging_aom"].append(roc_auc_score(y_val, agg_aom))
 
 		if verbose:
-			auc_i = roc_auc_score(y_true, scores)
-			print(f"  subset {i+1}/{n_subsets}: k={k}/{d} components, AUC={auc_i:.4f}")
+			print(f"  repeat {i+1}/{n_repeats}: no_bagging={repeat_results['no_bagging'][-1]:.4f}  "
+			      f"sum={repeat_results['bagging_sum'][-1]:.4f}  "
+			      f"max={repeat_results['bagging_max'][-1]:.4f}  "
+			      f"aom={repeat_results['bagging_aom'][-1]:.4f}")
 
-	subset_matrix = np.vstack(subset_scores)  # (n_subsets, n_samples)
+	if not repeat_results["no_bagging"]:
+		raise ValueError("Feature bagging repeated subsampling produced no valid repeats")
 
-	agg_sum = subset_matrix.sum(axis=0)
-
-	agg_max = subset_matrix.max(axis=0)
-
-	# AOM (Average of Maximum): bundle subsets into a handful of groups,
-	# take the max within each group, then average across groups - a
-	# middle ground between Sum (dilutes a signal only strong in a few
-	# subsets) and Max (no dilution but sensitive to single-subset noise)
-	n_groups = min(5, n_subsets)
-	groups = np.array_split(subset_matrix, n_groups, axis=0)
-	agg_aom = np.mean([g.max(axis=0) for g in groups], axis=0)
-
-	return {
-		"no_bagging": base_auc,
-		"bagging_sum": roc_auc_score(y_true, agg_sum),
-		"bagging_max": roc_auc_score(y_true, agg_max),
-		"bagging_aom": roc_auc_score(y_true, agg_aom),
-	}
+	summary = {}
+	for key, vals in repeat_results.items():
+		summary[key] = {
+			"mean": float(np.mean(vals)),
+			"std": float(np.std(vals, ddof=1)),
+			"n": len(vals),
+		}
+	return summary
 
 
 def feature_bagging_comparison(X_train, train_labels, args):
-	# Runs feature_bagging_metrics separately for each of FEATURE_BAGGING_METHODS
-	# (no mixing of method and subspace across methods), prints per-method
-	# results plus a summary table (methods x {no_bagging, sum, max, aom}).
+	# Runs feature_bagging_repeated_metrics separately for each of
+	# FEATURE_BAGGING_METHODS (no mixing of method and subspace across
+	# methods), prints per-method mean +/- std plus a summary table.
+	total_fits = args.n_repeats * args.n_subsets * len(FEATURE_BAGGING_METHODS)
 	print("="*60)
-	print(f"FEATURE BAGGING: {', '.join(FEATURE_BAGGING_METHODS)}")
+	print(f"FEATURE BAGGING (repeated subsampling): {', '.join(FEATURE_BAGGING_METHODS)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
-	      f"n_subsets={args.n_subsets})")
+	      f"n_repeats={args.n_repeats}, n_subsets={args.n_subsets})")
+	print(f"Total fits: {args.n_repeats} repeats x {args.n_subsets} subsets x "
+	      f"{len(FEATURE_BAGGING_METHODS)} methods = {total_fits}")
 	print("="*60 + "\n")
 
 	rows = {}
@@ -635,98 +703,132 @@ def feature_bagging_comparison(X_train, train_labels, args):
 		print("#" * 60)
 		print(f"# METHOD: {method}")
 		print("#" * 60)
-		rows[method] = feature_bagging_metrics(
-			X_train, train_labels, args, method, n_subsets=args.n_subsets,
+		rows[method] = feature_bagging_repeated_metrics(
+			X_train, train_labels, args, method,
+			n_repeats=args.n_repeats, n_subsets=args.n_subsets, verbose=True,
 		)
+		for key, stats in rows[method].items():
+			print(f"  {key:<12} {stats['mean']:.4f} +/- {stats['std']:.4f}  ({stats['n']} repeats)")
 		print()
 
-	summary = pd.DataFrame(rows).T
-	summary.index.name = "method"
-
 	print("=" * 60)
-	print("FEATURE BAGGING SUMMARY (AUC, full-train post-hoc)")
+	print("FEATURE BAGGING SUMMARY (mean +/- std over repeats)")
 	print("no_bagging = single model on all components (Step A baseline)")
 	print("=" * 60)
-	print(summary.round(4).to_string())
+	header = f"{'method':<18}" + "".join(f"{k:>20}" for k in ["no_bagging", "sum", "max", "aom"])
+	print(header)
+	for method in FEATURE_BAGGING_METHODS:
+		r = rows[method]
+		line = f"{method:<18}"
+		for key in ["no_bagging", "bagging_sum", "bagging_max", "bagging_aom"]:
+			line += f"{r[key]['mean']:>12.4f}+/-{r[key]['std']:.4f}"
+		print(line)
 	print("=" * 60 + "\n")
 
 
-def heterogeneous_ensemble_metrics(X_train, train_labels, args, methods, verbose=True):
-	# Step C (Week 3 plan): opposite of Step B - SAME full feature space for
-	# every method (no subspace split), diversity comes from the methods
-	# themselves instead of from feature subsets. Mixing method AND subspace
-	# would confound which one causes a result (see chat notes) - that's
-	# exactly what this avoids.
-	X_red = fit_scale_reduce(X_train, args.reduce, args.n_components, args.random_state, args.scale)
-	y_true = np.asarray(train_labels == "active", dtype=int)
+def heterogeneous_ensemble_repeated_metrics(X_train, train_labels, args, methods, n_repeats=25,
+                                             inlier_frac=0.8, outlier_frac=0.8, verbose=True):
+	# Step C, full repeated-subsampling version (see chat notes: only
+	# n_repeats * len(methods) fits total, e.g. 25*3=75 - no extra
+	# multiplier like Step B, since there's no subset loop here, just one
+	# fit per method per repeat). Same 80/20 split logic as Step A/B.
+	y = np.asarray(train_labels == "active", dtype=int)
+	inlier_idx_all = np.where(y == 0)[0]
+	outlier_idx_all = np.where(y == 1)[0]
 
-	method_scores = {}
-	for method in methods:
-		detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
-		detector.fit(X_red)
-		scores = -detector.score_samples(X_red)
-		auc = roc_auc_score(y_true, scores)
-		method_scores[method] = scores
+	repeat_results = {m: [] for m in methods}
+	repeat_results.update({"ensemble_sum": [], "ensemble_max": [], "ensemble_rank_avg": []})
+
+	for i in range(n_repeats):
+		train_idx, val_idx = _repeated_split_indices(
+			y, inlier_idx_all, outlier_idx_all, args.random_state + i, inlier_frac, outlier_frac,
+		)
+
+		X_tr = X_train.iloc[train_idx]
+		X_val = X_train.iloc[val_idx]
+		y_val = y[val_idx]
+
+		if y_val.sum() == 0 or y_val.sum() == len(y_val):
+			if verbose:
+				print(f"  repeat {i+1}/{n_repeats}: skipped (val split has a single class)")
+			continue
+
+		X_tr_red, scaler, reducer = fit_scale_reduce(
+			X_tr, args.reduce, args.n_components, args.random_state, args.scale,
+			return_fitted=True,
+		)
+		X_val_red = transform_scale_reduce(X_val, scaler, reducer)
+
+		method_scores_val = {}
+		for method in methods:
+			detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
+			detector.fit(X_tr_red)
+			scores_val = -detector.score_samples(X_val_red)
+			method_scores_val[method] = scores_val
+			repeat_results[method].append(roc_auc_score(y_val, scores_val))
+
+		# z-normalize using this repeat's val scores - methods are on
+		# completely different scales (IF ~[-0.6,0.6], KNN distances,
+		# OCSVM signed margin, ...)
+		scores_z = {m: (s - s.mean()) / (s.std() + 1e-12) for m, s in method_scores_val.items()}
+		stacked = np.vstack(list(scores_z.values()))
+
+		agg_sum = stacked.sum(axis=0)
+		agg_max = stacked.max(axis=0)
+		ranks = np.vstack([pd.Series(s).rank().values for s in scores_z.values()])
+		agg_rank = ranks.mean(axis=0)
+
+		repeat_results["ensemble_sum"].append(roc_auc_score(y_val, agg_sum))
+		repeat_results["ensemble_max"].append(roc_auc_score(y_val, agg_max))
+		repeat_results["ensemble_rank_avg"].append(roc_auc_score(y_val, agg_rank))
+
 		if verbose:
-			print(f"  {method}: AUC={auc:.4f}")
+			method_str = "  ".join(f"{m}={repeat_results[m][-1]:.4f}" for m in methods)
+			print(f"  repeat {i+1}/{n_repeats}: {method_str}  "
+			      f"sum={repeat_results['ensemble_sum'][-1]:.4f}  "
+			      f"max={repeat_results['ensemble_max'][-1]:.4f}  "
+			      f"rank_avg={repeat_results['ensemble_rank_avg'][-1]:.4f}")
 
-	# z-normalize before combining - methods are on completely different
-	# scales (IF ~[-0.6,0.6], KNN distances, OCSVM signed margin, ...),
-	# combining raw scores would just favor whichever method has the
-	# largest numbers, same reasoning as Step B
-	scores_z = {m: (s - s.mean()) / (s.std() + 1e-12) for m, s in method_scores.items()}
-	stacked = np.vstack(list(scores_z.values()))  # (n_methods, n_samples)
+	if not repeat_results["ensemble_sum"]:
+		raise ValueError("Heterogeneous ensemble repeated subsampling produced no valid repeats")
 
-	agg_sum = stacked.sum(axis=0)
-	agg_max = stacked.max(axis=0)
-
-	if verbose:
-		dominant_idx = np.argmax(stacked, axis=0)
-		method_names = list(scores_z.keys())
-		dominance = pd.Series(dominant_idx).map(lambda i: method_names[i]).value_counts(normalize=True)
-		print(f"  which method has the highest z-score, per sample (dominance in --max): "
-		      f"{dict(dominance.round(3))}")
-	# AOM doesn't apply meaningfully with only 3 "subsets" (=methods) here -
-	# group size would be 1, i.e. identical to max. Use rank-averaging
-	# instead as the third combination rule, common for heterogeneous
-	# ensembles (see chat notes on Step C).
-	# pd.Series.rank() assigns ascending ranks (1=smallest value). Since
-	# scores_z is already in "higher = more anomalous" convention, a higher
-	# rank number already means more anomalous too - no sign flip needed
-	# here, unlike a naive reading might suggest.
-	ranks = np.vstack([pd.Series(s).rank().values for s in scores_z.values()])
-	agg_rank = ranks.mean(axis=0)
-
-	individual_aucs = {m: roc_auc_score(y_true, s) for m, s in method_scores.items()}
-	return {
-		**individual_aucs,
-		"ensemble_sum": roc_auc_score(y_true, agg_sum),
-		"ensemble_max": roc_auc_score(y_true, agg_max),
-		"ensemble_rank_avg": roc_auc_score(y_true, agg_rank),
-	}
+	summary = {}
+	for key, vals in repeat_results.items():
+		summary[key] = {
+			"mean": float(np.mean(vals)),
+			"std": float(np.std(vals, ddof=1)),
+			"n": len(vals),
+		}
+	return summary
 
 
 def heterogeneous_ensemble_comparison(X_train, train_labels, args):
 	# Runs FEATURE_BAGGING_METHODS (same Top-3 as Step B) all on the same
-	# full reduced feature space, combines via sum/max/rank-averaging,
-	# prints individual method AUCs plus the three ensemble variants.
+	# repeated-subsampling splits, combines via sum/max/rank-averaging,
+	# prints individual method mean +/- std plus the three ensemble variants.
+	total_fits = args.n_repeats * len(FEATURE_BAGGING_METHODS)
 	print("="*60)
-	print(f"HETEROGENEOUS ENSEMBLE: {', '.join(FEATURE_BAGGING_METHODS)}")
+	print(f"HETEROGENEOUS ENSEMBLE (repeated subsampling): {', '.join(FEATURE_BAGGING_METHODS)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
-	      f"same feature space for all methods)")
+	      f"n_repeats={args.n_repeats}, same feature space for all methods)")
+	print(f"Total fits: {args.n_repeats} repeats x {len(FEATURE_BAGGING_METHODS)} methods = {total_fits}")
 	print("="*60 + "\n")
 
-	results = heterogeneous_ensemble_metrics(X_train, train_labels, args, FEATURE_BAGGING_METHODS)
+	results = heterogeneous_ensemble_repeated_metrics(
+		X_train, train_labels, args, FEATURE_BAGGING_METHODS, n_repeats=args.n_repeats, verbose=True,
+	)
 
 	print("\n" + "=" * 60)
-	print("HETEROGENEOUS ENSEMBLE SUMMARY (AUC, full-train post-hoc)")
+	print("HETEROGENEOUS ENSEMBLE SUMMARY (mean +/- std over repeats)")
 	print("=" * 60)
 	for method in FEATURE_BAGGING_METHODS:
-		print(f"  {method:<20} {results[method]:.4f}")
-	print("  " + "-" * 30)
-	print(f"  {'ensemble (sum)':<20} {results['ensemble_sum']:.4f}")
-	print(f"  {'ensemble (max)':<20} {results['ensemble_max']:.4f}")
-	print(f"  {'ensemble (rank avg)':<20} {results['ensemble_rank_avg']:.4f}")
+		r = results[method]
+		print(f"  {method:<20} {r['mean']:.4f} +/- {r['std']:.4f}")
+	print("  " + "-" * 40)
+	for key, label in [("ensemble_sum", "ensemble (sum)"), ("ensemble_max", "ensemble (max)"),
+	                    ("ensemble_rank_avg", "ensemble (rank avg)")]:
+		r = results[key]
+		print(f"  {label:<20} {r['mean']:.4f} +/- {r['std']:.4f}")
 	print("=" * 60 + "\n")
 
 
@@ -851,16 +953,19 @@ def main():
 	                          f"then exit. Overrides --method and --eval-strategy.")
 	parser.add_argument("--feature-bagging", action="store_true",
 	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
-	                          f"fit --n-subsets models on random feature subsets of the "
-	                          f"reduced space, compare no_bagging vs sum/max/aom aggregation "
-	                          f"(full-train post-hoc AUC, not repeated_subsampling - see "
-	                          f"chat notes on cost). Overrides --method/--compare-methods.")
+	                          f"repeated subsampling (--n-repeats) with --n-subsets random "
+	                          f"feature subsets fit INSIDE each repeat, compare no_bagging vs "
+	                          f"sum/max/aom aggregation. Total fits per method = n_repeats * "
+	                          f"n_subsets (e.g. 25*10=250, x3 methods=750). "
+	                          f"Overrides --method/--compare-methods.")
 	parser.add_argument("--n-subsets", type=int, default=10,
-	                     help="Number of random feature subsets per method for --feature-bagging")
+	                     help="Number of random feature subsets per repeat for --feature-bagging")
 	parser.add_argument("--heterogeneous-ensemble", action="store_true",
 	                     help=f"Step C: {FEATURE_BAGGING_METHODS} on the SAME full feature "
 	                          f"space (no subspace split, opposite of --feature-bagging), "
-	                          f"scores z-normalized and combined via sum/max/rank-averaging. "
+	                          f"repeated subsampling (--n-repeats), scores z-normalized and "
+	                          f"combined via sum/max/rank-averaging each repeat. Total fits = "
+	                          f"n_repeats * 3 methods (e.g. 25*3=75). "
 	                          f"Overrides --method/--compare-methods/--feature-bagging.")
 	parser.add_argument("--n-estimators", type=int, default=200,
 	                     help="Number of trees in the Isolation Forest")
@@ -875,7 +980,8 @@ def main():
 	parser.add_argument("--cv-folds", type=int, default=3,
 	                     help="K-fold CV on train for internal AUC/MCC (--eval-strategy cv)")
 	parser.add_argument("--n-repeats", type=int, default=25,
-	                     help="Repeats for --eval-strategy repeated_subsampling / --compare-methods")
+	                     help="Repeats for --eval-strategy repeated_subsampling / "
+	                          "--compare-methods / --feature-bagging / --heterogeneous-ensemble")
 	parser.add_argument("--scale", action=argparse.BooleanOptionalAction, default=True,
 	                     help="StandardScaler before reduction (fit on train fold in CV, full train for final model)")
 	parser.add_argument("--smote", action=argparse.BooleanOptionalAction, default=False,
