@@ -341,3 +341,63 @@ convention (full-train post-hoc) than Step A's repeated-subsampling
 numbers, so it is a "best across setups" statement rather than a single
 directly-comparable ranking — see the per-section notes above for how
 each number was produced.
+
+## Week 4 — key findings
+
+Follow-up on Week 3: upgrading Steps B and C to give proper
+repeated-subsampling statistics (mean ± std) instead of single full-train
+point estimates.
+
+### Steps B/C upgraded to full repeated subsampling
+
+Steps B and C originally used a single full-train post-hoc check (fit
+and score on all training data, no held-out split) — fast, but only one
+point estimate, no standard deviation, unlike Step A. Both were rebuilt
+to use the same 80/20 repeated-subsampling split logic as Step A:
+scale+reduce fit on the train split only, evaluated on the held-out
+validation split, repeated 25 times.
+
+Cost difference: Step B needs `n_subsets` extra fits inside every single
+repeat (one model per feature subset before aggregation), so total fits
+per method = n_repeats × n_subsets (750 total for 3 methods). Step C
+needs only one fit per method per repeat (no subset loop), so only
+n_repeats × 3 = **75** fits total.
+
+Results at n=147 (same value as the already-presented slides), now with
+proper mean ± std:
+
+**Step B (repeated subsampling, 750 fits):**
+
+| Method | No bagging | Sum | Max | AOM |
+|--------|-----------|-----|-----|-----|
+| Isolation Forest | 0.7249 ± 0.0226 | 0.7310 ± 0.0195 | 0.7308 ± 0.0206 | **0.7314 ± 0.0197** |
+| KNN | 0.6997 ± 0.0205 | **0.7016 ± 0.0202** | 0.6976 ± 0.0210 | 0.6999 ± 0.0203 |
+| OCSVM | 0.6860 ± 0.0175 | 0.6953 ± 0.0186 | **0.6970 ± 0.0177** | 0.6920 ± 0.0180 |
+
+The `no_bagging` column exactly reproduces Step A's baseline numbers,
+confirming the new implementation is consistent. The bagging gain is
+smaller than the old full-train post-hoc numbers suggested (those were
+optimistically biased), but the direction — small, consistent
+improvement — holds.
+
+**Step C (repeated subsampling, 75 fits):**
+
+| | AUC |
+|---|-----|
+| Isolation Forest (alone) | **0.7249 ± 0.0226** |
+| KNN (alone) | 0.6997 ± 0.0205 |
+| OCSVM (alone) | 0.6860 ± 0.0175 |
+| Ensemble (Sum) | 0.7079 ± 0.0194 |
+| Ensemble (Max) | 0.7037 ± 0.0172 |
+| Ensemble (Rank avg) | 0.7089 ± 0.0197 |
+
+Same negative result as before, now on a paired, per-repeat basis:
+Isolation Forest beats the ensemble in nearly every individual repeat,
+not just on average — stronger evidence than the single full-train
+comparison could give.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 --n-repeats 25 --n-subsets 10
+python p53_od_pipeline.py --heterogeneous-ensemble --reduce pca --n-components 147 --n-repeats 25
+```

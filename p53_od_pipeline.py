@@ -19,9 +19,9 @@ Pipeline Steps:
 
 Method comparison (--compare-methods): runs the Week 3 OCC methods in
 COMPARE_METHODS through repeated_subsampling (always, regardless of
---eval-strategy), prints the per-repeat AUC matrix to the terminal (no
-file written) - this is the input for next week's Friedman/Conover-Iman
-test, just copy it from the terminal.
+--eval-strategy), prints the per-repeat AUC matrix, and with --output-csv
+also saves it (5 columns: one per method) - this is one of the two
+possible inputs for --stat-test below.
 
 COF is excluded from COMPARE_METHODS - PyOD's implementation is too slow
 at ~20k train rows per repeat (near-O(n^2) pairwise connectivity), a
@@ -37,6 +37,19 @@ METHOD (e.g. 25 * 10 = 250, times 3 methods = 750 total), and
 --heterogeneous-ensemble does n_repeats fits per method (25 * 3 = 75
 total) - see chat notes on why the two scale so differently (Step B needs
 n_subsets extra fits inside every single repeat, Step C doesn't).
+--feature-bagging --output-csv saves a 12-column matrix (3 methods x 4
+aggregation variants: no_bagging/sum/max/aom) - the other possible input
+for --stat-test.
+
+Statistical testing (--stat-test): Week 4. Runs a Friedman test (global:
+do all configurations in the given matrix differ?) followed by, if
+significant, a Conover-Iman post-hoc test (pairwise: which configurations
+differ from which?) on ANY repeats x configurations AUC matrix CSV - so
+the same command works on the --compare-methods matrix (5 methods) and
+the --feature-bagging matrix (12 method+aggregation variants), or any
+other matrix with the same repeats-as-rows/configs-as-columns shape.
+Prints a ++/+/- significance table (row significantly better than
+column); save it with --output-csv.
 """
 
 import argparse
@@ -45,6 +58,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import scikit_posthocs as sp
+import scipy.stats as stats
 from sklearn.base import BaseEstimator
 from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.ensemble import IsolationForest
@@ -708,8 +723,8 @@ def feature_bagging_comparison(X_train, train_labels, args):
 			X_train, train_labels, args, method,
 			n_repeats=args.n_repeats, n_subsets=args.n_subsets, verbose=False,
 		)
-		for key, stats in rows[method].items():
-			print(f"  {key:<12} {stats['mean']:.4f} +/- {stats['std']:.4f}  ({stats['n']} repeats)")
+		for key, stats_ in rows[method].items():
+			print(f"  {key:<12} {stats_['mean']:.4f} +/- {stats_['std']:.4f}  ({stats_['n']} repeats)")
 		print()
 
 	print("=" * 60)
@@ -926,10 +941,11 @@ def compare_methods(X_train, train_labels, args):
 	# the terminal. Always uses repeated_subsampling regardless of
 	# --eval-strategy - this comparison mode is separate from the single-
 	# method CV/repeated_subsampling choice above. If --output-csv is set,
-	# also writes the matrix to disk - this is the direct input for the
-	# Friedman/Conover-Iman test (Week 4): 25 rows (repeats/blocks) x 5
-	# columns (methods, no-bagging AUC only - Feature Bagging variants are
-	# a separate question with a separate test, not mixed in here).
+	# also writes the matrix to disk - this is one of the two direct
+	# inputs for --stat-test (Friedman/Conover-Iman, Week 4): 25 rows
+	# (repeats/blocks) x 5 columns (methods, no-bagging AUC only -
+	# Feature Bagging variants are a separate question, see
+	# feature_bagging_comparison above).
 	print("="*60)
 	print(f"COMPARING METHODS: {', '.join(COMPARE_METHODS)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
@@ -961,7 +977,7 @@ def compare_methods(X_train, train_labels, args):
 
 	print("=" * 60)
 	print(f"AUC MATRIX ({matrix.shape[0]} repeats x {matrix.shape[1]} methods)")
-	print("copy this for next week's Friedman/Conover-Iman test")
+	print("run --stat-test on the saved CSV for the Friedman/Conover-Iman test")
 	print("=" * 60)
 	print(matrix.round(4).to_string())
 	print()
@@ -976,6 +992,92 @@ def compare_methods(X_train, train_labels, args):
 		      f"({matrix.shape[0]} rows x {matrix.shape[1]} columns, no header index beyond 'repeat')\n")
 
 
+def friedman_conover_test(matrix, alpha=0.05):
+	# Week 4: Friedman test (global, paired/blocked design - rows=repeats
+	# are the blocks, columns=configurations are the groups) followed by,
+	# if significant, Conover-Iman post-hoc (pairwise). This is generic
+	# over the column set - works the same whether columns are the 5
+	# --compare-methods methods or the 12 --feature-bagging configurations.
+	# Returns (friedman_stat, friedman_p, conover_pvals_or_None, sig_table_or_None).
+	stat, p = stats.friedmanchisquare(*[matrix[c] for c in matrix.columns])
+
+	print("=" * 60)
+	print("FRIEDMAN TEST (global: are all configurations equal?)")
+	print("=" * 60)
+	print(f"chi-square statistic: {stat:.4f}")
+	print(f"p-value: {p:.6f}")
+
+	if p > alpha:
+		print(f"p > alpha ({alpha}) -> H0 NOT rejected, no significant difference found")
+		print("Post-hoc test skipped (omnibus test not significant).")
+		print("=" * 60 + "\n")
+		return stat, p, None, None
+	print(f"p <= alpha ({alpha}) -> H0 rejected, configurations differ significantly")
+	print("=" * 60 + "\n")
+
+	pvals = sp.posthoc_conover_friedman(matrix)
+	print("=" * 60)
+	print("CONOVER-IMAN POST-HOC TEST (pairwise p-values)")
+	print("=" * 60)
+	print(pvals.round(4).to_string())
+	print("=" * 60 + "\n")
+
+	# Significance table convention (Week 4 slides):
+	#   "++" : p<=0.05 and mean(row) > mean(column)
+	#   "+"  : p<=0.10 and mean(row) > mean(column)
+	#   "-"  : mean(row) <= mean(column), not significant either way
+	means = matrix.mean()
+	configs = matrix.columns
+	sig_table = pd.DataFrame("", index=configs, columns=configs)
+	for row in configs:
+		for col in configs:
+			if row == col:
+				continue
+			p_ij = pvals.loc[row, col]
+			row_higher = means[row] > means[col]
+			if p_ij <= 0.05 and row_higher:
+				sig_table.loc[row, col] = "++"
+			elif p_ij <= 0.10 and row_higher:
+				sig_table.loc[row, col] = "+"
+			elif not row_higher:
+				sig_table.loc[row, col] = "-"
+
+	print("=" * 60)
+	print("SIGNIFICANCE TABLE (row vs column)")
+	print("++ : p<=0.05, row significantly better | + : p<=0.10, row better")
+	print("-  : row not better (numerically worse or equal)")
+	print("=" * 60)
+	print(sig_table.to_string())
+	print("=" * 60 + "\n")
+
+	return stat, p, pvals, sig_table
+
+
+def run_statistical_test(args):
+	# Entry point for --stat-test: reads any repeats x configurations AUC
+	# matrix CSV (from --compare-methods --output-csv or --feature-bagging
+	# --output-csv) and runs friedman_conover_test on it. Doesn't need
+	# X_train/X_test/train_labels at all, so main() must call this BEFORE
+	# load_data() to skip the (slow) parquet loading entirely.
+	print("=" * 60)
+	print(f"STATISTICAL TEST (Friedman + Conover-Iman): {args.stat_test}")
+	print("=" * 60 + "\n")
+
+	matrix = pd.read_csv(args.stat_test, index_col=0)
+	print(f"Matrix: {matrix.shape[0]} repeats x {matrix.shape[1]} configurations")
+	print(f"Configurations: {', '.join(matrix.columns)}\n")
+	print("Mean +/- Std per configuration:")
+	print((matrix.mean().round(4).astype(str) + " +/- " + matrix.std(ddof=1).round(4).astype(str)).to_string())
+	print()
+
+	_, _, _, sig_table = friedman_conover_test(matrix, alpha=args.alpha)
+
+	if sig_table is not None and getattr(args, "output_csv", None):
+		Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+		sig_table.to_csv(args.output_csv)
+		print(f"Saved significance table to {args.output_csv}\n")
+
+
 def main():
 	parser = argparse.ArgumentParser(description="p53 Outlier Detection Pipeline")
 	parser.add_argument("--method", type=str, default="isolation_forest",
@@ -987,12 +1089,11 @@ def main():
 	                          f"per-repeat AUC matrix to the terminal, then exit. "
 	                          f"Overrides --method and --eval-strategy.")
 	parser.add_argument("--output-csv", type=str, default=None,
-	                     help="Save repeats x configurations AUC matrix to this CSV path "
-	                          "(input for Friedman/Conover-Iman, Week 4). With "
+	                     help="Save repeats x configurations AUC matrix to this CSV path. With "
 	                          "--compare-methods: 5 columns, no-bagging AUC only. With "
 	                          "--feature-bagging: 12 columns (3 methods x 4 aggregation "
-	                          "variants: no_bagging/sum/max/aom) - a separate test question "
-	                          "from the 5-method comparison.")
+	                          "variants: no_bagging/sum/max/aom). With --stat-test: saves the "
+	                          "resulting ++/+/- significance table instead of an AUC matrix.")
 	parser.add_argument("--feature-bagging", action="store_true",
 	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
 	                          f"repeated subsampling (--n-repeats) with --n-subsets random "
@@ -1009,6 +1110,15 @@ def main():
 	                          f"combined via sum/max/rank-averaging each repeat. Total fits = "
 	                          f"n_repeats * 3 methods (e.g. 25*3=75). "
 	                          f"Overrides --method/--compare-methods/--feature-bagging.")
+	parser.add_argument("--stat-test", type=str, default=None,
+	                     help="Week 4: path to a repeats x configurations AUC matrix CSV "
+	                          "(from --compare-methods --output-csv or --feature-bagging "
+	                          "--output-csv). Runs a Friedman test, then (if significant) "
+	                          "Conover-Iman post-hoc, and prints a ++/+/- significance table. "
+	                          "Save the table with --output-csv. Skips data loading entirely - "
+	                          "overrides all other modes.")
+	parser.add_argument("--alpha", type=float, default=0.05,
+	                     help="Significance level for --stat-test's Friedman test")
 	parser.add_argument("--n-estimators", type=int, default=200,
 	                     help="Number of trees in the Isolation Forest")
 	parser.add_argument("--random-state", type=int, default=42)
@@ -1046,6 +1156,11 @@ def main():
 	                     help="Comma-separated n_components to compare, e.g. 10,20,50,147,300 "
 	                          "(finds each method's own best dimension instead of a fixed one)")
 	args = parser.parse_args()
+
+	if args.stat_test:
+		# No X_train/X_test/train_labels needed - skip load_data() entirely.
+		run_statistical_test(args)
+		return
 
 	X_train, X_test, train_labels = load_data()
 	test_ids = X_test.index
