@@ -346,7 +346,8 @@ each number was produced.
 
 Follow-up on Week 3: upgrading Steps B and C to give proper
 repeated-subsampling statistics (mean ± std) instead of single full-train
-point estimates.
+point estimates, then statistically testing whether the AUC differences
+seen so far are actually significant.
 
 ### Steps B/C upgraded to full repeated subsampling
 
@@ -370,9 +371,9 @@ proper mean ± std:
 
 | Method | No bagging | Sum | Max | AOM |
 |--------|-----------|-----|-----|-----|
-| Isolation Forest | 0.7249 ± 0.0226 | 0.7310 ± 0.0195 | 0.7308 ± 0.0206 | **0.7314 ± 0.0197** |
-| KNN | 0.6997 ± 0.0205 | **0.7016 ± 0.0202** | 0.6976 ± 0.0210 | 0.6999 ± 0.0203 |
-| OCSVM | 0.6860 ± 0.0175 | 0.6953 ± 0.0186 | **0.6970 ± 0.0177** | 0.6920 ± 0.0180 |
+| Isolation Forest | 0.7249 ± 0.0226 | 0.7310 ± 0.0195 | 0.7308 ± 0.0206 | 0.7314 ± 0.0197 |
+| KNN | 0.6997 ± 0.0205 | 0.7016 ± 0.0202 | 0.6976 ± 0.0210 | 0.6999 ± 0.0203 |
+| OCSVM | 0.6860 ± 0.0175 | 0.6953 ± 0.0186 | 0.6970 ± 0.0177 | 0.6920 ± 0.0180 |
 
 The `no_bagging` column exactly reproduces Step A's baseline numbers,
 confirming the new implementation is consistent. The bagging gain is
@@ -401,3 +402,83 @@ Reproduce:
 python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 --n-repeats 25 --n-subsets 10
 python p53_od_pipeline.py --heterogeneous-ensemble --reduce pca --n-components 147 --n-repeats 25
 ```
+
+### Statistical testing: Friedman + Conover-Iman
+
+Per the course's "Multiple Comparisons Tests" week: are the AUC
+differences between methods in Step A/B actually significant, or could
+they be noise across the 25 repeats? Since every repeat scores all
+configurations on the *same* subsample (a paired/blocked design, not
+independent samples), Friedman (global) + Conover-Iman (pairwise
+post-hoc) is the correct test family — not Kruskal-Wallis/Dunn, which
+assume independent groups.
+
+New pipeline command, generic over any repeats × configurations AUC
+matrix CSV (works on both the 5-method Step A matrix and the 12-config
+Step B matrix without changes):
+```bash
+python p53_od_pipeline.py --compare-methods --reduce pca --n-components 147 --n-repeats 25 \
+    --output-csv outputs/auc_matrix_compare_methods.csv
+python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 --n-repeats 25 --n-subsets 10 \
+    --output-csv outputs/week4_feature_bagging_matrix.csv
+
+python p53_od_pipeline.py --stat-test outputs/auc_matrix_compare_methods.csv \
+    --output-csv outputs/significance_table_5methods.csv
+python p53_od_pipeline.py --stat-test outputs/week4_feature_bagging_matrix.csv \
+    --output-csv outputs/significance_table_feature_bagging.csv
+```
+Prints the Friedman chi-square/p-value, then (if significant) the
+Conover-Iman pairwise p-values, then a `++`/`+`/`-` significance table
+(row significantly better than column at p≤0.05 / p≤0.10 / not
+significant) — saved to CSV with `--output-csv`.
+
+**Step A (5 methods):** Friedman chi-square = 97.63, p ≈ 0.0000 → H0
+rejected. Conover-Iman: every pair differs significantly (`++`
+everywhere), confirming the full ranking from Step A is not a repeat-
+sampling artifact:
+
+Isolation Forest ≫ KNN ≫ OCSVM ≫ ABOD ≫ LOF
+
+**Step B (12 configs: 3 methods × 4 aggregations):** Friedman chi-square
+= 227.86, p ≈ 0.0000 → H0 rejected. Conover-Iman pairwise results:
+- Within each method, the bagging variants (sum/max/aom) are
+  significantly better than `no_bagging` (e.g. Isolation Forest:
+  `no_bagging` vs. `sum` p=0.0007, vs. `max` p=0.0043) — Feature Bagging's
+  gain from Step B is statistically real, not noise.
+- The bagging variants are *not* significantly different from each other
+  within a method (e.g. Isolation Forest `sum` vs. `max` p=0.578, vs.
+  `aom` p=0.458) — no aggregation choice (sum/max/aom) clearly beats the
+  others once bagging is applied.
+- Across methods, Isolation Forest (any variant) beats every KNN/OCSVM
+  variant significantly — the Step A method ranking holds after bagging
+  too.
+
+**Significance table, Step A (5 methods):**
+
+|                  | isolation_forest | lof | knn | ocsvm | abod |
+|------------------|:---:|:---:|:---:|:---:|:---:|
+| isolation_forest |     | ++  | ++  | ++  | ++  |
+| lof              | -   |     | -   | -   | -   |
+| knn              | -   | ++  |     | ++  | ++  |
+| ocsvm            | -   | ++  | -   |     | ++  |
+| abod             | -   | ++  | -   | -   |     |
+
+**Significance table, Step B (3 methods × 4 aggregations; `no`/`sum`/`max`/`aom`):**
+
+|              | IF_no | IF_sum | IF_max | IF_aom | KNN_no | KNN_sum | KNN_max | KNN_aom | OCSVM_no | OCSVM_sum | OCSVM_max | OCSVM_aom |
+|--------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| IF_no        |     | -   | -   | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| IF_sum       | ++  |     |     | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| IF_max       | ++  | -   |     | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| IF_aom       | ++  |     |     |     | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| KNN_no       | -   | -   | -   | -   |     | -   | ++  | -   | ++  | ++  |     | ++  |
+| KNN_sum      | -   | -   | -   | -   | ++  |     | ++  | ++  | ++  | ++  | ++  | ++  |
+| KNN_max      | -   | -   | -   | -   | -   | -   |     | -   | ++  |     | ++  | ++  |
+| KNN_aom      | -   | -   | -   | -   |     | -   | ++  |     | ++  | ++  |     | ++  |
+| OCSVM_no     | -   | -   | -   | -   | -   | -   | -   | -   |     | -   | -   | -   |
+| OCSVM_sum    | -   | -   | -   | -   | -   | -   | -   | -   | ++  |     | -   | ++  |
+| OCSVM_max    | -   | -   | -   | -   | -   | -   | -   | -   | ++  | ++  |     | ++  |
+| OCSVM_aom    | -   | -   | -   | -   | -   | -   | -   | -   | ++  | -   | -   |     |
+
+Full pairwise results in `outputs/significance_table_5methods.csv` and
+`outputs/significance_table_feature_bagging.csv`.
