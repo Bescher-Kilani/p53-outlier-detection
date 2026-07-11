@@ -705,7 +705,7 @@ def feature_bagging_comparison(X_train, train_labels, args):
 		print("#" * 60)
 		rows[method] = feature_bagging_repeated_metrics(
 			X_train, train_labels, args, method,
-			n_repeats=args.n_repeats, n_subsets=args.n_subsets, verbose=True,
+			n_repeats=args.n_repeats, n_subsets=args.n_subsets, verbose=False,
 		)
 		for key, stats in rows[method].items():
 			print(f"  {key:<12} {stats['mean']:.4f} +/- {stats['std']:.4f}  ({stats['n']} repeats)")
@@ -898,9 +898,11 @@ def compare_methods(X_train, train_labels, args):
 	# feature space for every method), prints the per-repeat AUC matrix to
 	# the terminal. Always uses repeated_subsampling regardless of
 	# --eval-strategy - this comparison mode is separate from the single-
-	# method CV/repeated_subsampling choice above. Nothing is written to
-	# disk - copy the printed table for the Friedman/Conover-Iman test
-	# next week.
+	# method CV/repeated_subsampling choice above. If --output-csv is set,
+	# also writes the matrix to disk - this is the direct input for the
+	# Friedman/Conover-Iman test (Week 4): 25 rows (repeats/blocks) x 5
+	# columns (methods, no-bagging AUC only - Feature Bagging variants are
+	# a separate question with a separate test, not mixed in here).
 	print("="*60)
 	print(f"COMPARING METHODS: {', '.join(COMPARE_METHODS)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
@@ -940,6 +942,12 @@ def compare_methods(X_train, train_labels, args):
 	print((matrix.mean().round(4).astype(str) + " +/- " + matrix.std(ddof=1).round(4).astype(str)).to_string())
 	print("=" * 60 + "\n")
 
+	if getattr(args, "output_csv", None):
+		Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+		matrix.to_csv(args.output_csv)
+		print(f"Saved AUC matrix to {args.output_csv} "
+		      f"({matrix.shape[0]} rows x {matrix.shape[1]} columns, no header index beyond 'repeat')\n")
+
 
 def main():
 	parser = argparse.ArgumentParser(description="p53 Outlier Detection Pipeline")
@@ -949,8 +957,12 @@ def main():
 	parser.add_argument("--compare-methods", action="store_true",
 	                     help=f"Run all of {COMPARE_METHODS} through repeated_subsampling "
 	                          f"with identical reduce/n_components/scale settings, print the "
-	                          f"per-repeat AUC matrix to the terminal (no file written), "
-	                          f"then exit. Overrides --method and --eval-strategy.")
+	                          f"per-repeat AUC matrix to the terminal, then exit. "
+	                          f"Overrides --method and --eval-strategy.")
+	parser.add_argument("--output-csv", type=str, default=None,
+	                     help="With --compare-methods: also save the repeats x methods AUC "
+	                          "matrix to this CSV path (input for the Friedman/Conover-Iman "
+	                          "test, Week 4). No-bagging AUCs only, 5 methods.")
 	parser.add_argument("--feature-bagging", action="store_true",
 	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
 	                          f"repeated subsampling (--n-repeats) with --n-subsets random "
