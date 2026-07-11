@@ -681,6 +681,7 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 			"mean": float(np.mean(vals)),
 			"std": float(np.std(vals, ddof=1)),
 			"n": len(vals),
+			"values": vals,  # raw per-repeat AUCs, needed for the CSV export (12-column matrix)
 		}
 	return summary
 
@@ -724,6 +725,32 @@ def feature_bagging_comparison(X_train, train_labels, args):
 			line += f"{r[key]['mean']:>12.4f}+/-{r[key]['std']:.4f}"
 		print(line)
 	print("=" * 60 + "\n")
+
+	if getattr(args, "output_csv", None):
+		# 12 columns: 3 methods x 4 aggregation variants (no_bagging/sum/max/aom),
+		# one row per repeat - for a statistical test comparing all 12
+		# method+aggregation configurations against each other (separate
+		# question from the --compare-methods 5-method test above).
+		variant_keys = ["no_bagging", "bagging_sum", "bagging_max", "bagging_aom"]
+		variant_labels = ["no_bagging", "sum", "max", "aom"]
+		columns = {}
+		for method in FEATURE_BAGGING_METHODS:
+			for key, label in zip(variant_keys, variant_labels):
+				columns[f"{method}_{label}"] = rows[method][key]["values"]
+
+		min_len = min(len(v) for v in columns.values())
+		if any(len(v) != min_len for v in columns.values()):
+			print(f"WARNING: configurations had different numbers of valid repeats, "
+			      f"truncating all to {min_len} for the matrix.\n")
+
+		matrix = pd.DataFrame({k: v[:min_len] for k, v in columns.items()})
+		matrix.index.name = "repeat"
+
+		Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+		matrix.to_csv(args.output_csv)
+		print(f"Saved feature bagging AUC matrix to {args.output_csv} "
+		      f"({matrix.shape[0]} rows x {matrix.shape[1]} columns: "
+		      f"{len(FEATURE_BAGGING_METHODS)} methods x {len(variant_labels)} aggregations)\n")
 
 
 def heterogeneous_ensemble_repeated_metrics(X_train, train_labels, args, methods, n_repeats=25,
@@ -960,9 +987,12 @@ def main():
 	                          f"per-repeat AUC matrix to the terminal, then exit. "
 	                          f"Overrides --method and --eval-strategy.")
 	parser.add_argument("--output-csv", type=str, default=None,
-	                     help="With --compare-methods: also save the repeats x methods AUC "
-	                          "matrix to this CSV path (input for the Friedman/Conover-Iman "
-	                          "test, Week 4). No-bagging AUCs only, 5 methods.")
+	                     help="Save repeats x configurations AUC matrix to this CSV path "
+	                          "(input for Friedman/Conover-Iman, Week 4). With "
+	                          "--compare-methods: 5 columns, no-bagging AUC only. With "
+	                          "--feature-bagging: 12 columns (3 methods x 4 aggregation "
+	                          "variants: no_bagging/sum/max/aom) - a separate test question "
+	                          "from the 5-method comparison.")
 	parser.add_argument("--feature-bagging", action="store_true",
 	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
 	                          f"repeated subsampling (--n-repeats) with --n-subsets random "
