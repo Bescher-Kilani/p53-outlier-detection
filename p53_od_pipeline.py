@@ -73,10 +73,10 @@ from sklearn.svm import OneClassSVM
 
 from mrmr_ifs import MRMRIFSSelector
 
-COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod"]
+COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod", "deep_svdd"]
 
-# Step B (Week 3 plan): Top-3 from Step A, one family each (subspace/locality/cluster)
-FEATURE_BAGGING_METHODS = ["isolation_forest", "knn", "ocsvm"]
+# Step B: Top-3 from Step A + Deep SVDD (cluster-based, same slot as OCSVM for Week 4)
+FEATURE_BAGGING_METHODS = ["isolation_forest", "knn", "ocsvm", "deep_svdd"]
 
 
 def load_data():
@@ -169,6 +169,37 @@ class PyODAdapter(BaseEstimator):
 		return -self.model.decision_function(np.asarray(X))
 
 
+class DeepSVDDDetector(BaseEstimator):
+	# PyOD DeepSVDD needs n_features at init; infer from fit data so feature
+	# bagging works on column subsets. preprocessing=False — scale+PCA already
+	# applied upstream. Trained on inlier-only rows in repeated_subsampling (OCC).
+	def __init__(self, random_state=42, epochs=20, batch_size=512):
+		self.random_state = random_state
+		self.epochs = epochs
+		self.batch_size = batch_size
+		self.model_ = None
+
+	def fit(self, X, y=None):
+		from pyod.models.deep_svdd import DeepSVDD
+
+		X_arr = np.asarray(X, dtype=np.float32)
+		self.model_ = DeepSVDD(
+			n_features=X_arr.shape[1],
+			epochs=self.epochs,
+			batch_size=self.batch_size,
+			hidden_neurons=[64, 32],
+			preprocessing=False,
+			verbose=0,
+			random_state=self.random_state,
+			contamination=0.05,
+		)
+		self.model_.fit(X_arr)
+		return self
+
+	def score_samples(self, X):
+		return -self.model_.decision_function(np.asarray(X, dtype=np.float32))
+
+
 def make_detector(method, n_estimators, random_state, max_subspaces):
 	if method == "isolation_forest":
 		return IsolationForest(
@@ -199,6 +230,8 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 		# method="fast" = neighbor-based approximation (naive ABOD is
 		# O(n^3), infeasible at ~20k train rows)
 		return PyODAdapter(ABOD(n_neighbors=10, method="fast"))
+	if method == "deep_svdd":
+		return DeepSVDDDetector(random_state=random_state)
 	raise ValueError(f"Unknown method: {method}")
 
 
@@ -324,6 +357,7 @@ _DETECTOR_LABELS = {
 	"knn": "FITTING KNN (PyOD, n_neighbors=20)",
 	"ocsvm": "FITTING ONE-CLASS SVM (sklearn, rbf kernel)",
 	"abod": "FITTING FAST-ABOD (PyOD, n_neighbors=10)",
+	"deep_svdd": "FITTING DEEP SVDD (PyOD, MLP [64,32], epochs=20, inlier-only OCC)",
 }
 
 
@@ -1081,7 +1115,7 @@ def run_statistical_test(args):
 def main():
 	parser = argparse.ArgumentParser(description="p53 Outlier Detection Pipeline")
 	parser.add_argument("--method", type=str, default="isolation_forest",
-	                     choices=["isolation_forest", "lof", "gmd_lof", "cof", "knn", "ocsvm", "abod"],
+	                     choices=["isolation_forest", "lof", "gmd_lof", "cof", "knn", "ocsvm", "abod", "deep_svdd"],
 	                     help="Outlier detection method")
 	parser.add_argument("--compare-methods", action="store_true",
 	                     help=f"Run all of {COMPARE_METHODS} through repeated_subsampling "

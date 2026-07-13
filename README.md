@@ -420,11 +420,14 @@ Step B matrix without changes):
 python p53_od_pipeline.py --compare-methods --reduce pca --n-components 147 --n-repeats 25 \
     --output-csv outputs/auc_matrix_compare_methods.csv
 python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 --n-repeats 25 --n-subsets 10 \
-    --output-csv outputs/week4_feature_bagging_matrix.csv
+    --output-csv outputs/auc_feature_bagging_matrix.csv
+
+# Deep SVDD added later (same OCC setup: PCA 147 + scale, inlier-only fit):
+python benchmark_deep_svdd_week4.py --n-repeats 25 --n-subsets 10
 
 python p53_od_pipeline.py --stat-test outputs/auc_matrix_compare_methods.csv \
-    --output-csv outputs/significance_table_5methods.csv
-python p53_od_pipeline.py --stat-test outputs/week4_feature_bagging_matrix.csv \
+    --output-csv outputs/significance_table_compare_methods.csv
+python p53_od_pipeline.py --stat-test outputs/auc_feature_bagging_matrix.csv \
     --output-csv outputs/significance_table_feature_bagging.csv
 ```
 Prints the Friedman chi-square/p-value, then (if significant) the
@@ -432,15 +435,28 @@ Conover-Iman pairwise p-values, then a `++`/`+`/`-` significance table
 (row significantly better than column at p≤0.05 / p≤0.10 / not
 significant) — saved to CSV with `--output-csv`.
 
-**Step A (5 methods):** Friedman chi-square = 97.63, p ≈ 0.0000 → H0
-rejected. Conover-Iman: every pair differs significantly (`++`
-everywhere), confirming the full ranking from Step A is not a repeat-
-sampling artifact:
+**Step A (6 methods, incl. Deep SVDD):** Friedman chi-square = 107.31, p ≈ 0.0000 → H0
+rejected. Conover-Iman confirms the Step A ranking is not a repeat-sampling
+artifact:
 
-Isolation Forest ≫ KNN ≫ OCSVM ≫ ABOD ≫ LOF
+Isolation Forest ≫ KNN ≈ Deep SVDD ≫ OCSVM ≫ ABOD ≫ LOF
 
-**Step B (12 configs: 3 methods × 4 aggregations):** Friedman chi-square
-= 227.86, p ≈ 0.0000 → H0 rejected. Conover-Iman pairwise results:
+| Method | AUC (25 repeats) | Family |
+|--------|------------------|--------|
+| Isolation Forest | **0.7248 ± 0.0227** | Subspace |
+| KNN | 0.6997 ± 0.0205 | Locality |
+| **Deep SVDD** | **0.6981 ± 0.0351** | Cluster (neural) |
+| OCSVM | 0.6860 ± 0.0175 | Cluster |
+| ABOD | 0.6494 ± 0.0195 | Subspace |
+| LOF | 0.5067 ± 0.0227 | Locality |
+
+Deep SVDD (PyOD, MLP `[64,32]`, 20 epochs, `preprocessing=False` after
+PCA+scale, **inlier-only** `.fit()`) lands between KNN and OCSVM — slightly
+below kernel OCSVM's cluster-based cousin on this PCA space, and **not**
+significantly different from KNN (pairwise n.s.).
+
+**Step B (16 configs: 4 methods × 4 aggregations, incl. Deep SVDD):** Friedman
+chi-square = 303.95, p ≈ 0.0000 → H0 rejected. Conover-Iman pairwise results:
 - Within each method, the bagging variants (sum/max/aom) are
   significantly better than `no_bagging` (e.g. Isolation Forest:
   `no_bagging` vs. `sum` p=0.0007, vs. `max` p=0.0043) — Feature Bagging's
@@ -449,36 +465,75 @@ Isolation Forest ≫ KNN ≫ OCSVM ≫ ABOD ≫ LOF
   within a method (e.g. Isolation Forest `sum` vs. `max` p=0.578, vs.
   `aom` p=0.458) — no aggregation choice (sum/max/aom) clearly beats the
   others once bagging is applied.
-- Across methods, Isolation Forest (any variant) beats every KNN/OCSVM
-  variant significantly — the Step A method ranking holds after bagging
+- Across methods, Isolation Forest (any variant) beats every KNN/OCSVM/Deep
+  SVDD variant significantly — the Step A method ranking holds after bagging
   too.
+- **Deep SVDD:** `no_bagging` best (**0.6981 ± 0.0351**); feature bagging
+  **hurts** (sum 0.6747, max 0.6543, aom 0.6726) — unlike IF/KNN/OCSVM.
+  Deep SVDD is not a good candidate for Step B ensembling on this data.
 
-**Significance table, Step A (5 methods):**
+| Method | No bagging | Sum | Max | AOM |
+|--------|-----------|-----|-----|-----|
+| Isolation Forest | 0.7279 | 0.7335 | **0.7354** | 0.7344 |
+| KNN | 0.6816 | **0.6861** | 0.6834 | 0.6852 |
+| OCSVM | 0.6891 | 0.6990 | **0.7012** | 0.6945 |
+| **Deep SVDD** | **0.6981 ± 0.0351** | 0.6747 ± 0.0235 | 0.6543 ± 0.0276 | 0.6726 ± 0.0231 |
 
-|                  | isolation_forest | lof | knn | ocsvm | abod |
-|------------------|:---:|:---:|:---:|:---:|:---:|
-| isolation_forest |     | ++  | ++  | ++  | ++  |
-| lof              | -   |     | -   | -   | -   |
-| knn              | -   | ++  |     | ++  | ++  |
-| ocsvm            | -   | ++  | -   |     | ++  |
-| abod             | -   | ++  | -   | -   |     |
+**Significance table, Step A (6 methods):**
 
-**Significance table, Step B (3 methods × 4 aggregations; `no`/`sum`/`max`/`aom`):**
+|                  | isolation_forest | lof | knn | ocsvm | abod | deep_svdd |
+|------------------|:---:|:---:|:---:|:---:|:---:|:---:|
+| isolation_forest |     | ++  | ++  | ++  | ++  | ++  |
+| lof              | -   |     | -   | -   | -   | -   |
+| knn              | -   | ++  |     | ++  | ++  |     |
+| ocsvm            | -   | ++  | -   |     | ++  | -   |
+| abod             | -   | ++  | -   | -   |     | -   |
+| deep_svdd        | -   | ++  |     | ++  | ++  |     |
 
-|              | IF_no | IF_sum | IF_max | IF_aom | KNN_no | KNN_sum | KNN_max | KNN_aom | OCSVM_no | OCSVM_sum | OCSVM_max | OCSVM_aom |
-|--------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| IF_no        |     | -   | -   | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
-| IF_sum       | ++  |     |     | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
-| IF_max       | ++  | -   |     | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
-| IF_aom       | ++  |     |     |     | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
-| KNN_no       | -   | -   | -   | -   |     | -   | ++  | -   | ++  | ++  |     | ++  |
-| KNN_sum      | -   | -   | -   | -   | ++  |     | ++  | ++  | ++  | ++  | ++  | ++  |
-| KNN_max      | -   | -   | -   | -   | -   | -   |     | -   | ++  |     | ++  | ++  |
-| KNN_aom      | -   | -   | -   | -   |     | -   | ++  |     | ++  | ++  |     | ++  |
-| OCSVM_no     | -   | -   | -   | -   | -   | -   | -   | -   |     | -   | -   | -   |
-| OCSVM_sum    | -   | -   | -   | -   | -   | -   | -   | -   | ++  |     | -   | ++  |
-| OCSVM_max    | -   | -   | -   | -   | -   | -   | -   | -   | ++  | ++  |     | ++  |
-| OCSVM_aom    | -   | -   | -   | -   | -   | -   | -   | -   | ++  | -   | -   |     |
+**Significance table, Step B (4 methods × 4 aggregations; `no`/`sum`/`max`/`aom`):**
 
-Full pairwise results in `outputs/significance_table_5methods.csv` and
+|              | IF_no | IF_sum | IF_max | IF_aom | KNN_no | KNN_sum | KNN_max | KNN_aom | OCSVM_no | OCSVM_sum | OCSVM_max | OCSVM_aom | DSVD_no | DSVD_sum | DSVD_max | DSVD_aom |
+|--------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| IF_no        |     | -   | -   | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| IF_sum       | ++  |     |     | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| IF_max       | ++  | -   |     | -   | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| IF_aom       | ++  |     |     |     | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  | ++  |
+| KNN_no       | -   | -   | -   | -   |     | -   | ++  | -   | ++  | ++  |     | ++  |     | ++  | ++  | ++  |
+| KNN_sum      | -   | -   | -   | -   | ++  |     | ++  | ++  | ++  | ++  | ++  | ++  |     | ++  | ++  | ++  |
+| KNN_max      | -   | -   | -   | -   | -   | -   |     | -   | ++  |     | ++  | ++  | -   | ++  | ++  | +   |
+| KNN_aom      | -   | -   | -   | -   |     | -   | ++  |     | ++  | ++  |     | ++  |     | ++  | ++  | ++  |
+| OCSVM_no     | -   | -   | -   | -   | -   | -   | -   | -   |     | -   | -   | -   |     | ++  | ++  | ++  |
+| OCSVM_sum    | -   | -   | -   | -   | -   | -   | -   | -   | ++  |     | -   | ++  |     | ++  | ++  | ++  |
+| OCSVM_max    | -   | -   | -   | -   | -   | -   | -   | -   | ++  | ++  |     | ++  |     | ++  | ++  | ++  |
+| OCSVM_aom    | -   | -   | -   | -   | -   | -   | -   | -   | ++  | -   | -   |     |     | ++  | ++  | ++  |
+| DSVD_no      | -   | -   | -   | -   |     | -   | +   | -   | ++  |     |     | ++  |     | ++  | ++  | ++  |
+| DSVD_sum     | -   | -   | -   | -   | -   | -   | -   | -   |     | -   | -   | -   |     |     | ++  | +   |
+| DSVD_max     | -   | -   | -   | -   | -   | -   | -   | -   |     | -   | -   | -   |     | -   |     | -   |
+| DSVD_aom     | -   | -   | -   | -   | -   | -   | -   | -   |     | -   | -   | -   |     |     | ++  |     |
+
+Full pairwise results in `outputs/significance_table_compare_methods.csv` and
 `outputs/significance_table_feature_bagging.csv`.
+
+### Week 4 best (OCC deliverable)
+
+After comparing six detectors (Step A), feature bagging (Step B), and
+Friedman/Conover-Iman on 25 repeated subsamples:
+
+| Rank | Configuration | AUC | Why |
+|------|---------------|-----|-----|
+| **1 (use this)** | **Isolation Forest + PCA (147) + StandardScaler + feature bagging (AOM)** | **0.7354** | Highest AUC in Step B; significantly beats every other method/aggregation in the significance table; fully OCC (inlier-only `.fit()`); small but real gain from bagging (+0.75 pp vs IF alone) |
+| 2 | Isolation Forest + PCA (147) + scale (no bagging) | 0.7248 ± 0.0227 | Best single detector in Step A; simpler, nearly as good |
+| 3 | OCSVM + bagging (max) | 0.7012 | Best cluster-based variant; still well below IF |
+| — | Deep SVDD + PCA + scale | 0.6981 ± 0.0351 | Comparable to KNN; bagging hurts — not recommended |
+| — | Heterogeneous ensemble (IF + KNN + OCSVM) | ~0.705 | Step C: mixing methods **below** IF alone — do not use |
+
+**Pipeline command for the Week 4 winner:**
+
+```bash
+python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 147 \
+    --feature-bagging --n-repeats 25 --n-subsets 10
+```
+
+Use **max** aggregation when reading Step B output (`isolation_forest_max` column in
+`outputs/auc_feature_bagging_matrix.csv`). Labels are for evaluation only — never
+passed into `.fit()`.
