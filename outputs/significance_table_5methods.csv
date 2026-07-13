@@ -1,0 +1,6 @@
+,isolation_forest,lof,knn,ocsvm,abod
+isolation_forest,,++,++,++,++
+lof,-,,-,-,-
+knn,-,++,,++,++
+ocsvm,-,++,-,,++
+abod,-,++,-,-,

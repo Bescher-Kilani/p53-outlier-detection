@@ -1,0 +1,13 @@
+,isolation_forest_no_bagging,isolation_forest_sum,isolation_forest_max,isolation_forest_aom,knn_no_bagging,knn_sum,knn_max,knn_aom,ocsvm_no_bagging,ocsvm_sum,ocsvm_max,ocsvm_aom
+isolation_forest_no_bagging,,-,-,-,++,++,++,++,++,++,++,++
+isolation_forest_sum,++,,,-,++,++,++,++,++,++,++,++
+isolation_forest_max,++,-,,-,++,++,++,++,++,++,++,++
+isolation_forest_aom,++,,,,++,++,++,++,++,++,++,++
+knn_no_bagging,-,-,-,-,,-,++,-,++,++,,++
+knn_sum,-,-,-,-,++,,++,++,++,++,++,++
+knn_max,-,-,-,-,-,-,,-,++,,++,++
+knn_aom,-,-,-,-,,-,++,,++,++,,++
+ocsvm_no_bagging,-,-,-,-,-,-,-,-,,-,-,-
+ocsvm_sum,-,-,-,-,-,-,-,-,++,,-,++
+ocsvm_max,-,-,-,-,-,-,-,-,++,++,,++
+ocsvm_aom,-,-,-,-,-,-,-,-,++,-,-,
