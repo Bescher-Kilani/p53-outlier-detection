@@ -105,6 +105,12 @@ COMPARE_METHODS_WEEK5 = COMPARE_METHODS + ["tabpfn"]
 # (see module docstring for why).
 FEATURE_BAGGING_METHODS = ["isolation_forest"]
 
+# Week 5, Step 3: heterogeneous ensemble uses the Top-3 methods from Step 1
+# (isolation_forest, tabpfn, knn) as ensemble members - unlike Step 2, the
+# whole point here is combining DIFFERENT methods, so this needs its own
+# 3-method list rather than reusing FEATURE_BAGGING_METHODS.
+HETEROGENEOUS_ENSEMBLE_METHODS = ["isolation_forest", "tabpfn", "knn"]
+
 
 def load_data():
 	print("\n" + "="*60)
@@ -1050,7 +1056,10 @@ def heterogeneous_ensemble_repeated_metrics(X_train, train_labels, args, methods
 	outlier_idx_all = np.where(y == 1)[0]
 
 	repeat_results = {m: [] for m in methods}
-	repeat_results.update({"ensemble_sum": [], "ensemble_max": [], "ensemble_rank_avg": []})
+	repeat_results.update({
+		"ensemble_sum": [], "ensemble_max": [], "ensemble_rank_avg": [],
+		"ensemble_pruned": [], "ensemble_damped": [],
+	})
 
 	for i in range(n_repeats):
 		train_idx, val_idx = _repeated_split_indices(
@@ -1084,23 +1093,43 @@ def heterogeneous_ensemble_repeated_metrics(X_train, train_labels, args, methods
 		# completely different scales (IF ~[-0.6,0.6], KNN distances,
 		# OCSVM signed margin, ...)
 		scores_z = {m: (s - s.mean()) / (s.std() + 1e-12) for m, s in method_scores_val.items()}
-		stacked = np.vstack(list(scores_z.values()))
+		stacked = np.vstack(list(scores_z.values()))  # (n_methods, n_val)
+		n_methods = stacked.shape[0]
 
 		agg_sum = stacked.sum(axis=0)
 		agg_max = stacked.max(axis=0)
 		ranks = np.vstack([pd.Series(s).rank().values for s in scores_z.values()])
 		agg_rank = ranks.mean(axis=0)
 
+		# pruned: keep only the methods most correlated with the ensemble
+		# consensus (mean of all z-normalized method scores), then average
+		# those - same recipe as feature_bagging_repeated_metrics's pruned,
+		# just over methods instead of feature subsets.
+		consensus = stacked.mean(axis=0)
+		correlations = np.array([
+			np.corrcoef(stacked[s], consensus)[0, 1] for s in range(n_methods)
+		])
+		keep_mask = correlations >= np.median(correlations)
+		agg_pruned = stacked[keep_mask].mean(axis=0)
+
+		# damped: clip each method's z-scores to [-3, 3] before averaging.
+		damped_matrix = np.clip(stacked, -3, 3)
+		agg_damped = damped_matrix.mean(axis=0)
+
 		repeat_results["ensemble_sum"].append(roc_auc_score(y_val, agg_sum))
 		repeat_results["ensemble_max"].append(roc_auc_score(y_val, agg_max))
 		repeat_results["ensemble_rank_avg"].append(roc_auc_score(y_val, agg_rank))
+		repeat_results["ensemble_pruned"].append(roc_auc_score(y_val, agg_pruned))
+		repeat_results["ensemble_damped"].append(roc_auc_score(y_val, agg_damped))
 
 		if verbose:
 			method_str = "  ".join(f"{m}={repeat_results[m][-1]:.4f}" for m in methods)
 			print(f"  repeat {i+1}/{n_repeats}: {method_str}  "
 			      f"sum={repeat_results['ensemble_sum'][-1]:.4f}  "
 			      f"max={repeat_results['ensemble_max'][-1]:.4f}  "
-			      f"rank_avg={repeat_results['ensemble_rank_avg'][-1]:.4f}")
+			      f"rank_avg={repeat_results['ensemble_rank_avg'][-1]:.4f}  "
+			      f"pruned={repeat_results['ensemble_pruned'][-1]:.4f}  "
+			      f"damped={repeat_results['ensemble_damped'][-1]:.4f}")
 
 	if not repeat_results["ensemble_sum"]:
 		raise ValueError("Heterogeneous ensemble repeated subsampling produced no valid repeats")
@@ -1111,38 +1140,67 @@ def heterogeneous_ensemble_repeated_metrics(X_train, train_labels, args, methods
 			"mean": float(np.mean(vals)),
 			"std": float(np.std(vals, ddof=1)),
 			"n": len(vals),
+			"values": vals,  # raw per-repeat AUCs, needed for the CSV export
 		}
 	return summary
 
 
 def heterogeneous_ensemble_comparison(X_train, train_labels, args):
-	# Runs FEATURE_BAGGING_METHODS (same Top-3 as Step B) all on the same
-	# repeated-subsampling splits, combines via sum/max/rank-averaging,
-	# prints individual method mean +/- std plus the three ensemble variants.
-	total_fits = args.n_repeats * len(FEATURE_BAGGING_METHODS)
+	# Runs HETEROGENEOUS_ENSEMBLE_METHODS (Top-3 from Step 1: isolation_forest,
+	# tabpfn, knn) all on the same repeated-subsampling splits, combines via
+	# sum/max/rank_avg/pruned/damped (same 5-variant recipe as Step 2's
+	# feature bagging, just over methods instead of feature subsets),
+	# prints individual method mean +/- std plus the ensemble variants.
+	total_fits = args.n_repeats * len(HETEROGENEOUS_ENSEMBLE_METHODS)
 	print("="*60)
-	print(f"HETEROGENEOUS ENSEMBLE (repeated subsampling): {', '.join(FEATURE_BAGGING_METHODS)}")
+	print(f"HETEROGENEOUS ENSEMBLE (repeated subsampling): {', '.join(HETEROGENEOUS_ENSEMBLE_METHODS)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
 	      f"n_repeats={args.n_repeats}, same feature space for all methods)")
-	print(f"Total fits: {args.n_repeats} repeats x {len(FEATURE_BAGGING_METHODS)} methods = {total_fits}")
+	print(f"Total fits: {args.n_repeats} repeats x {len(HETEROGENEOUS_ENSEMBLE_METHODS)} methods = {total_fits}")
 	print("="*60 + "\n")
 
 	results = heterogeneous_ensemble_repeated_metrics(
-		X_train, train_labels, args, FEATURE_BAGGING_METHODS, n_repeats=args.n_repeats, verbose=True,
+		X_train, train_labels, args, HETEROGENEOUS_ENSEMBLE_METHODS, n_repeats=args.n_repeats, verbose=True,
 	)
 
 	print("\n" + "=" * 60)
 	print("HETEROGENEOUS ENSEMBLE SUMMARY (mean +/- std over repeats)")
 	print("=" * 60)
-	for method in FEATURE_BAGGING_METHODS:
+	for method in HETEROGENEOUS_ENSEMBLE_METHODS:
 		r = results[method]
 		print(f"  {method:<20} {r['mean']:.4f} +/- {r['std']:.4f}")
 	print("  " + "-" * 40)
-	for key, label in [("ensemble_sum", "ensemble (sum)"), ("ensemble_max", "ensemble (max)"),
-	                    ("ensemble_rank_avg", "ensemble (rank avg)")]:
+	ensemble_variants = [
+		("ensemble_sum", "ensemble (sum)"), ("ensemble_max", "ensemble (max)"),
+		("ensemble_rank_avg", "ensemble (rank avg)"), ("ensemble_pruned", "ensemble (pruned)"),
+		("ensemble_damped", "ensemble (damped)"),
+	]
+	for key, label in ensemble_variants:
 		r = results[key]
 		print(f"  {label:<20} {r['mean']:.4f} +/- {r['std']:.4f}")
 	print("=" * 60 + "\n")
+
+	if getattr(args, "output_csv", None):
+		# len(HETEROGENEOUS_ENSEMBLE_METHODS) individual methods + 5 ensemble
+		# variants, one row per repeat - for --stat-test.
+		columns = {m: results[m]["values"] for m in HETEROGENEOUS_ENSEMBLE_METHODS}
+		for key, _ in ensemble_variants:
+			columns[key] = results[key]["values"]
+
+		min_len = min(len(v) for v in columns.values())
+		if any(len(v) != min_len for v in columns.values()):
+			print(f"WARNING: configurations had different numbers of valid repeats, "
+			      f"truncating all to {min_len} for the matrix.\n")
+
+		matrix = pd.DataFrame({k: v[:min_len] for k, v in columns.items()})
+		matrix.index.name = "repeat"
+
+		Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+		matrix.to_csv(args.output_csv)
+		print(f"Saved heterogeneous ensemble AUC matrix to {args.output_csv} "
+		      f"({matrix.shape[0]} rows x {matrix.shape[1]} columns: "
+		      f"{len(HETEROGENEOUS_ENSEMBLE_METHODS)} methods + {len(ensemble_variants)} "
+		      f"ensemble variants)\n")
 
 
 def print_eval_metrics(metrics, label):
@@ -1404,11 +1462,13 @@ def main():
 	parser.add_argument("--vgan-lr", type=float, default=0.001,
 	                     help="Learning rate for --subspace-method vgan")
 	parser.add_argument("--heterogeneous-ensemble", action="store_true",
-	                     help=f"Step C: {FEATURE_BAGGING_METHODS} on the SAME full feature "
-	                          f"space (no subspace split, opposite of --feature-bagging), "
-	                          f"repeated subsampling (--n-repeats), scores z-normalized and "
-	                          f"combined via sum/max/rank-averaging each repeat. "
-	                          f"Overrides --method/--compare-methods/--feature-bagging.")
+	                     help=f"Step 3 (Week 5): {HETEROGENEOUS_ENSEMBLE_METHODS} (Top-3 from "
+	                          f"Step 1) on the SAME full feature space (no subspace split, "
+	                          f"opposite of --feature-bagging), repeated subsampling "
+	                          f"(--n-repeats), scores z-normalized and combined via "
+	                          f"sum/max/rank_avg/pruned/damped each repeat (same 5-variant "
+	                          f"recipe as --feature-bagging, over methods instead of feature "
+	                          f"subsets). Overrides --method/--compare-methods/--feature-bagging.")
 	parser.add_argument("--stat-test", type=str, default=None,
 	                     help="Week 4: path to a repeats x configurations AUC matrix CSV. "
 	                          "Runs a Friedman test, then (if significant) Conover-Iman "
