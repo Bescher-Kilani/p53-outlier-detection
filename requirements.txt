@@ -7,3 +7,5 @@ imbalanced-learn
 pyod
 torch
 scikit-posthocs
+tabpfn
+tabpfn-extensions

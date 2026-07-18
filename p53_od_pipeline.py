@@ -41,6 +41,15 @@ n_subsets extra fits inside every single repeat, Step C doesn't).
 aggregation variants: no_bagging/sum/max/aom) - the other possible input
 for --stat-test.
 
+Week 5, Step 1: TabPFN (--method tabpfn, zero-shot foundation model via
+tabpfn_extensions) added as a new detector. Gated on HuggingFace - before
+first use on the server, accept the license at
+https://huggingface.co/Prior-Labs/tabpfn_3 and run `hf auth login` (or
+set HF_TOKEN), otherwise fit() raises TabPFNHuggingFaceGatedRepoError.
+See COMPARE_METHODS_WEEK5 / --methods-set below to compare tabpfn
+against all 6 methods from last week in one run. Cost/OOM fixes and
+throttling params are documented on TabPFNDetector itself.
+
 Statistical testing (--stat-test): Week 4. Runs a Friedman test (global:
 do all configurations in the given matrix differ?) followed by, if
 significant, a Conover-Iman post-hoc test (pairwise: which configurations
@@ -74,6 +83,15 @@ from sklearn.svm import OneClassSVM
 from mrmr_ifs import MRMRIFSSelector
 
 COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod", "deep_svdd"]
+
+# Week 5, Step 1: TabPFN compared against all 6 methods from last week
+# (isolation_forest, lof, knn, ocsvm, abod, deep_svdd) - reuses COMPARE_METHODS
+# rather than a separate hand-picked baseline, so this doubles as the
+# "other OD methods" comparison (KNN, OCSVM, etc. are already in there).
+# Two commands for Step 1:
+#   --compare-methods                     (last week's default, unchanged)
+#   --compare-methods --methods-set week5 (same 6 + tabpfn)
+COMPARE_METHODS_WEEK5 = COMPARE_METHODS + ["tabpfn"]
 
 # Step B: Top-3 from Step A + Deep SVDD (cluster-based, same slot as OCSVM for Week 4)
 FEATURE_BAGGING_METHODS = ["isolation_forest", "knn", "ocsvm", "deep_svdd"]
@@ -200,6 +218,78 @@ class DeepSVDDDetector(BaseEstimator):
 		return -self.model_.decision_function(np.asarray(X, dtype=np.float32))
 
 
+class TabPFNDetector(BaseEstimator):
+	# Zero-shot foundation model via Prior Labs' TabPFNUnsupervisedModel:
+	# estimates per-sample likelihood, low likelihood = anomalous. fit(X)
+	# only, no labels - fits the OCC rule as-is.
+	#
+	# TabPFN v2 limits: <=500 features, <=10_000 context rows. PCA-147 is
+	# already under the feature limit; max_context below subsamples rows
+	# if the train fold is larger.
+	#
+	# COST: outliers() does one forward pass per feature per permutation
+	# (no built-in way to limit features). At d=147/n_permutations=10
+	# that's ~1470 passes per score_samples() call - hung 10+ min and
+	# OOM'd on an idle RTX 4090 on the server. Fixed via three levers:
+	# n_permutations 10->2, max_context 3000->1000, max_features 147->30
+	# (takes the first N columns - relies on PCA ordering by explained
+	# variance, don't rely on this with --reduce != pca). ~25x fewer
+	# passes combined. Still consider running with few --n-repeats
+	# separately rather than inside --compare-methods.
+	def __init__(self, random_state=42, max_context=1000, n_permutations=2, max_features=30):
+		self.random_state = random_state
+		self.max_context = max_context
+		self.n_permutations = n_permutations
+		self.max_features = max_features
+		self.model_ = None
+
+	def fit(self, X, y=None):
+		from tabpfn import TabPFNClassifier, TabPFNRegressor
+		from tabpfn_extensions.unsupervised import TabPFNUnsupervisedModel
+
+		X_arr = np.asarray(X, dtype=np.float32)
+		if self.max_features is not None and X_arr.shape[1] > self.max_features:
+			X_arr = X_arr[:, :self.max_features]
+		if len(X_arr) > self.max_context:
+			rng = np.random.default_rng(self.random_state)
+			idx = rng.choice(len(X_arr), size=self.max_context, replace=False)
+			X_arr = X_arr[idx]
+
+		self.model_ = TabPFNUnsupervisedModel(
+			tabpfn_clf=TabPFNClassifier(random_state=self.random_state),
+			tabpfn_reg=TabPFNRegressor(random_state=self.random_state),
+		)
+		self.model_.fit(X_arr)
+		return self
+
+	def score_samples(self, X):
+		import torch
+
+		X_arr = np.asarray(X, dtype=np.float32)
+		if self.max_features is not None and X_arr.shape[1] > self.max_features:
+			X_arr = X_arr[:, :self.max_features]
+		X_t = torch.tensor(X_arr)
+		scores = self.model_.outliers(X_t, n_permutations=self.n_permutations)
+		scores = scores.detach().cpu().numpy()
+		# outliers() returns log(AM(densities)) - lower = more anomalous,
+		# which already matches sklearn's score_samples convention, so no
+		# sign flip here (unlike every other detector in this file).
+		#
+		# Non-finite values: extremely atypical points can underflow the
+		# log-density to -inf/nan, which crashes roc_auc_score. Remap to
+		# just outside this batch's own finite range (preserves ranking;
+		# -inf/nan -> most anomalous, +inf -> most normal) instead of a
+		# fixed constant.
+		finite = scores[np.isfinite(scores)]
+		if finite.size:
+			lo, hi = finite.min(), finite.max()
+		else:
+			lo, hi = -1.0, 1.0
+		pad = max(1.0, hi - lo)
+		scores = np.nan_to_num(scores, nan=lo - pad, posinf=hi + pad, neginf=lo - pad)
+		return scores
+
+
 def make_detector(method, n_estimators, random_state, max_subspaces):
 	if method == "isolation_forest":
 		return IsolationForest(
@@ -232,6 +322,8 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 		return PyODAdapter(ABOD(n_neighbors=10, method="fast"))
 	if method == "deep_svdd":
 		return DeepSVDDDetector(random_state=random_state)
+	if method == "tabpfn":
+		return TabPFNDetector(random_state=random_state)
 	raise ValueError(f"Unknown method: {method}")
 
 
@@ -969,7 +1061,7 @@ def run_pipeline(X_train, X_test, train_labels, test_ids, args, save=True):
 
 
 def compare_methods(X_train, train_labels, args):
-	# Runs COMPARE_METHODS through repeated_random_subsampling_metrics with
+	# Runs a method list through repeated_random_subsampling_metrics with
 	# identical reduce/n_components/scale settings (fair comparison, same
 	# feature space for every method), prints the per-repeat AUC matrix to
 	# the terminal. Always uses repeated_subsampling regardless of
@@ -977,17 +1069,30 @@ def compare_methods(X_train, train_labels, args):
 	# method CV/repeated_subsampling choice above. If --output-csv is set,
 	# also writes the matrix to disk - this is one of the two direct
 	# inputs for --stat-test (Friedman/Conover-Iman, Week 4): 25 rows
-	# (repeats/blocks) x 5 columns (methods, no-bagging AUC only -
+	# (repeats/blocks) x N columns (methods, no-bagging AUC only -
 	# Feature Bagging variants are a separate question, see
 	# feature_bagging_comparison above).
+	#
+	# Week 5: defaults to the original 6-method COMPARE_METHODS (unchanged,
+	# so the Week 4 comparison stays reproducible), but --methods-set lets
+	# you point this at COMPARE_METHODS_WEEK5 (same 6 methods + tabpfn) or
+	# any other comma-separated subset without touching this function again.
+	raw_methods_set = getattr(args, "methods_set", None)
+	if raw_methods_set is None:
+		methods = COMPARE_METHODS
+	elif raw_methods_set == "week5":
+		methods = COMPARE_METHODS_WEEK5
+	else:
+		methods = [m.strip() for m in raw_methods_set.split(",") if m.strip()]
+
 	print("="*60)
-	print(f"COMPARING METHODS: {', '.join(COMPARE_METHODS)}")
+	print(f"COMPARING METHODS: {', '.join(methods)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
 	      f"n_repeats={args.n_repeats})")
 	print("="*60 + "\n")
 
 	results = {}
-	for method in COMPARE_METHODS:
+	for method in methods:
 		print("#" * 60)
 		print(f"# METHOD: {method}")
 		print("#" * 60)
@@ -1075,6 +1180,10 @@ def friedman_conover_test(matrix, alpha=0.05):
 				sig_table.loc[row, col] = "+"
 			elif not row_higher:
 				sig_table.loc[row, col] = "-"
+			# else: numerically higher but not significant at either
+			# threshold - cell stays blank (original Week 3/4 convention,
+			# kept on request rather than the "always fill with -" fix
+			# discussed in chat).
 
 	print("=" * 60)
 	print("SIGNIFICANCE TABLE (row vs column)")
@@ -1115,13 +1224,21 @@ def run_statistical_test(args):
 def main():
 	parser = argparse.ArgumentParser(description="p53 Outlier Detection Pipeline")
 	parser.add_argument("--method", type=str, default="isolation_forest",
-	                     choices=["isolation_forest", "lof", "gmd_lof", "cof", "knn", "ocsvm", "abod", "deep_svdd"],
+	                     choices=["isolation_forest", "lof", "gmd_lof", "cof", "knn", "ocsvm", "abod",
+	                              "deep_svdd", "tabpfn"],
 	                     help="Outlier detection method")
 	parser.add_argument("--compare-methods", action="store_true",
 	                     help=f"Run all of {COMPARE_METHODS} through repeated_subsampling "
 	                          f"with identical reduce/n_components/scale settings, print the "
 	                          f"per-repeat AUC matrix to the terminal, then exit. "
-	                          f"Overrides --method and --eval-strategy.")
+	                          f"Overrides --method and --eval-strategy. See --methods-set to "
+	                          f"compare a different method list instead.")
+	parser.add_argument("--methods-set", type=str, default=None,
+	                     help="Week 5: which method list --compare-methods should use. "
+	                          "'week5' = COMPARE_METHODS_WEEK5 (last week's 6 methods + "
+	                          "tabpfn). Otherwise pass a comma-separated list of --method "
+	                          "names, e.g. 'isolation_forest,tabpfn'. Default: original "
+	                          "6-method COMPARE_METHODS (Week 4 behavior, unchanged).")
 	parser.add_argument("--output-csv", type=str, default=None,
 	                     help="Save repeats x configurations AUC matrix to this CSV path. With "
 	                          "--compare-methods: 5 columns, no-bagging AUC only. With "
