@@ -55,7 +55,9 @@ the existing sum/max/aom: pruned (drop the subsets least correlated with
 the ensemble consensus before averaging) and damped (clip z-scores to
 [-3,3] before averaging, so one runaway subset can't dominate). Subspace
 source is --subspace-method: 'random' (default, unchanged) or 'vgan'
-(V-GAN-generated subspaces, see VGANSubspaceGenerator).
+(V-GAN_no_kl-generated subspaces, trained once per repeat - see
+VGANSubspaceGenerator; needs vgan_lib/ bundled locally and
+torch-two-sample installed, see requirements.txt, neither is on PyPI).
 
 Statistical testing (--stat-test): Week 4. Runs a Friedman test (global:
 do all configurations in the given matrix differ?) followed by, if
@@ -295,6 +297,81 @@ class TabPFNDetector(BaseEstimator):
 		pad = max(1.0, hi - lo)
 		scores = np.nan_to_num(scores, nan=lo - pad, posinf=hi + pad, neginf=lo - pad)
 		return scores
+
+
+class VGANSubspaceGenerator:
+	# Wraps V-GAN (Cribeiro-Ramallo et al. 2025, "Adversarial Subspace
+	# Generation for Outlier Detection in High-Dimensional Data") as an
+	# alternative subspace source for --feature-bagging, instead of random
+	# feature subsets. Uses the no-kernel-learning variant (VGAN_no_kl) -
+	# simpler/faster to train than the paper's default kernel-learning
+	# VGAN, at some cost to subspace quality.
+	#
+	# Not pip-installable (no PyPI package, no setup.py in the repo) -
+	# source bundled locally under vgan_lib/ (copied from
+	# https://github.com/jcribeiro98/V-GAN's src/ folder, same internal
+	# structure so its relative imports still work). Also needs
+	# torch-two-sample, itself not on PyPI either - installed via git, see
+	# requirements.txt. vgan_lib/vgan.py imports torch_two_sample at
+	# module level even though VGAN_no_kl itself doesn't use it, so it's
+	# a hard dependency to even import the file.
+	#
+	# epochs=50 here is far below the paper's default (2000) - training
+	# V-GAN once per repeat (e.g. 25x in a full --feature-bagging run) at
+	# 2000 epochs would be prohibitively slow. 50 is a starting point to
+	# check whether V-GAN subspaces beat random ones at all before
+	# investing in a longer training budget (--vgan-epochs to sweep).
+	def __init__(self, epochs=50, lr=0.001, random_state=42):
+		self.epochs = epochs
+		self.lr = lr
+		self.random_state = random_state
+		self.model_ = None
+
+	def fit(self, X):
+		from vgan_lib.vgan import VGAN_no_kl
+
+		self.model_ = VGAN_no_kl(epochs=self.epochs, lr=self.lr, seed=self.random_state)
+		self.model_.fit(np.asarray(X, dtype=np.float32))
+		return self
+
+	def generate_column_masks(self, n_subsets):
+		# Returns n_subsets boolean numpy arrays (True = feature included) -
+		# same shape/indexing semantics as the integer index arrays the
+		# random path builds via rng_subsets.choice(), so X[:, mask] works
+		# identically downstream regardless of which path produced it.
+		subspaces = self.model_.generate_subspaces(n_subsets)
+		return [s.to("cpu").numpy() for s in subspaces]
+
+
+class VGANKernelSubspaceGenerator:
+	# Same idea as VGANSubspaceGenerator, but uses the paper's default
+	# kernel-learning variant (VGAN, not VGAN_no_kl) - trains an
+	# encoder/decoder alongside the generator (see module docstring in
+	# vgan_lib/vgan.py), which the paper reports as the stronger of the
+	# two variants for subspace quality, at extra per-epoch cost.
+	#
+	# VGAN's constructor takes separate lr_G/lr_D rather than a single lr
+	# (unlike VGAN_no_kl) - both set to the same --vgan-lr value here to
+	# keep the "same setup" comparison simple (chat request: same epochs
+	# and lr as the VGAN_no_kl run, not a separate tuning pass).
+	def __init__(self, epochs=50, lr=0.001, random_state=42):
+		self.epochs = epochs
+		self.lr = lr
+		self.random_state = random_state
+		self.model_ = None
+
+	def fit(self, X):
+		from vgan_lib.vgan import VGAN
+
+		self.model_ = VGAN(
+			epochs=self.epochs, lr_G=self.lr, lr_D=self.lr, seed=self.random_state,
+		)
+		self.model_.fit(np.asarray(X, dtype=np.float32))
+		return self
+
+	def generate_column_masks(self, n_subsets):
+		subspaces = self.model_.generate_subspaces(n_subsets)
+		return [s.to("cpu").numpy() for s in subspaces]
 
 
 def make_detector(method, n_estimators, random_state, max_subspaces):
@@ -757,11 +834,9 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 	#     dominate the sum/average.
 	if getattr(args, "feature_select", None) or getattr(args, "smote", False):
 		raise ValueError("feature bagging repeated subsampling doesn't support --feature-select/--smote")
-	if getattr(args, "subspace_method", "random") == "vgan":
-		raise NotImplementedError(
-			"--subspace-method vgan is not wired up yet (next step) - "
-			"only 'random' (the default, unchanged from before) works right now."
-		)
+	subspace_method = getattr(args, "subspace_method", "random")
+	vgan_epochs = getattr(args, "vgan_epochs", 50)
+	vgan_lr = getattr(args, "vgan_lr", 0.001)
 
 	y = np.asarray(train_labels == "active", dtype=int)
 	inlier_idx_all = np.where(y == 0)[0]
@@ -800,11 +875,43 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 		base_scores_val = -base_detector.score_samples(X_val_red)
 		repeat_results["no_bagging"].append(roc_auc_score(y_val, base_scores_val))
 
+		if subspace_method == "vgan":
+			# Train V-GAN once per repeat on this repeat's train split,
+			# then draw n_subsets subspaces from it - one VGAN fit, reused
+			# for all n_subsets detector fits in this repeat (matches the
+			# random path's cost shape: one rng, n_subsets draws from it).
+			# Total cost = n_repeats FULL VGAN trainings (each restarts
+			# from scratch, not resumed) - the per-epoch progress printed
+			# by VGAN_no_kl.fit() only reflects the CURRENT repeat, not
+			# the whole --feature-bagging run (source of confusion on the
+			# server, chat notes).
+			print(f"  [repeat {i+1}/{n_repeats}] training V-GAN (no kernel learning, "
+			      f"{vgan_epochs} epochs) for subspace generation...")
+			vgan_gen = VGANSubspaceGenerator(
+				epochs=vgan_epochs, lr=vgan_lr, random_state=args.random_state,
+			).fit(X_tr_red)
+			col_masks = vgan_gen.generate_column_masks(n_subsets)
+		elif subspace_method == "vgan_kernel":
+			# Same idea, kernel-learning variant (VGANKernelSubspaceGenerator) -
+			# same epochs/lr as --subspace-method vgan, per chat request to
+			# compare the two variants under an otherwise identical setup.
+			print(f"  [repeat {i+1}/{n_repeats}] training V-GAN (kernel learning, "
+			      f"{vgan_epochs} epochs) for subspace generation...")
+			vgan_gen = VGANKernelSubspaceGenerator(
+				epochs=vgan_epochs, lr=vgan_lr, random_state=args.random_state,
+			).fit(X_tr_red)
+			col_masks = vgan_gen.generate_column_masks(n_subsets)
+		else:
+			col_masks = None  # drawn inline per-subset below (unchanged random path)
+
 		rng_subsets = np.random.default_rng(args.random_state)
 		subset_scores_val = []
 		for j in range(n_subsets):
-			k = int(rng_subsets.integers(int(subset_min_frac * d), d + 1))
-			cols = rng_subsets.choice(d, size=k, replace=False)
+			if col_masks is not None:
+				cols = col_masks[j]
+			else:
+				k = int(rng_subsets.integers(int(subset_min_frac * d), d + 1))
+				cols = rng_subsets.choice(d, size=k, replace=False)
 
 			detector = make_detector(method, args.n_estimators, args.random_state + j + 1, args.max_subspaces)
 			detector.fit(X_tr_red[:, cols])
@@ -1282,10 +1389,20 @@ def main():
 	parser.add_argument("--n-subsets", type=int, default=10,
 	                     help="Number of random feature subsets per repeat for --feature-bagging")
 	parser.add_argument("--subspace-method", type=str, default="random",
-	                     choices=["random", "vgan"],
+	                     choices=["random", "vgan", "vgan_kernel"],
 	                     help="Week 5 Step 2: how --feature-bagging picks feature subsets. "
-	                          "'random' (default, unchanged from before) or 'vgan' "
-	                          "(V-GAN-generated subspaces).")
+	                          "'random' (default, unchanged from before), 'vgan' "
+	                          "(V-GAN_no_kl, no kernel learning) or 'vgan_kernel' "
+	                          "(V-GAN with kernel learning, the paper's default variant - "
+	                          "trains an encoder/decoder alongside the generator, slower "
+	                          "per epoch than 'vgan'). Both trained once per repeat on that "
+	                          "repeat's train split - see VGANSubspaceGenerator / "
+	                          "VGANKernelSubspaceGenerator.")
+	parser.add_argument("--vgan-epochs", type=int, default=50,
+	                     help="Training epochs for --subspace-method vgan (paper default is "
+	                          "2000, far too slow per-repeat here - 50 is a starting point).")
+	parser.add_argument("--vgan-lr", type=float, default=0.001,
+	                     help="Learning rate for --subspace-method vgan")
 	parser.add_argument("--heterogeneous-ensemble", action="store_true",
 	                     help=f"Step C: {FEATURE_BAGGING_METHODS} on the SAME full feature "
 	                          f"space (no subspace split, opposite of --feature-bagging), "
