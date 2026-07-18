@@ -33,13 +33,9 @@ Feature bagging (--feature-bagging) and heterogeneous ensemble
 (same 80/20 inlier/outlier split logic as Step A), not a single full-train
 post-hoc check - this gives a proper mean +/- std instead of one point
 estimate. Cost: --feature-bagging does n_repeats * n_subsets fits PER
-METHOD (e.g. 25 * 10 = 250, times 3 methods = 750 total), and
---heterogeneous-ensemble does n_repeats fits per method (25 * 3 = 75
-total) - see chat notes on why the two scale so differently (Step B needs
-n_subsets extra fits inside every single repeat, Step C doesn't).
---feature-bagging --output-csv saves a 12-column matrix (3 methods x 4
-aggregation variants: no_bagging/sum/max/aom) - the other possible input
-for --stat-test.
+METHOD, and --heterogeneous-ensemble does n_repeats fits per method - see
+chat notes on why the two scale so differently (Step B needs n_subsets
+extra fits inside every single repeat, Step C doesn't).
 
 Week 5, Step 1: TabPFN (--method tabpfn, zero-shot foundation model via
 tabpfn_extensions) added as a new detector. Gated on HuggingFace - before
@@ -50,15 +46,25 @@ See COMPARE_METHODS_WEEK5 / --methods-set below to compare tabpfn
 against all 6 methods from last week in one run. Cost/OOM fixes and
 throttling params are documented on TabPFNDetector itself.
 
+Week 5, Step 2: Feature Bagging restricted to isolation_forest only (Top-3
+from Step 1 was isolation_forest/tabpfn/knn, but feature bagging multiplies
+cost by n_subsets per repeat - too expensive for tabpfn, and isolation_forest
+alone is the cleanest test of whether subspace bagging helps at all before
+widening to other methods). Two new aggregation variants added alongside
+the existing sum/max/aom: pruned (drop the subsets least correlated with
+the ensemble consensus before averaging) and damped (clip z-scores to
+[-3,3] before averaging, so one runaway subset can't dominate). Subspace
+source is --subspace-method: 'random' (default, unchanged) or 'vgan'
+(V-GAN-generated subspaces, see VGANSubspaceGenerator).
+
 Statistical testing (--stat-test): Week 4. Runs a Friedman test (global:
 do all configurations in the given matrix differ?) followed by, if
 significant, a Conover-Iman post-hoc test (pairwise: which configurations
 differ from which?) on ANY repeats x configurations AUC matrix CSV - so
-the same command works on the --compare-methods matrix (5 methods) and
-the --feature-bagging matrix (12 method+aggregation variants), or any
-other matrix with the same repeats-as-rows/configs-as-columns shape.
-Prints a ++/+/- significance table (row significantly better than
-column); save it with --output-csv.
+the same command works on the --compare-methods matrix and the
+--feature-bagging matrix, or any other matrix with the same
+repeats-as-rows/configs-as-columns shape. Prints a ++/+/- significance
+table (row significantly better than column); save it with --output-csv.
 """
 
 import argparse
@@ -93,8 +99,9 @@ COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod", "deep_svdd
 #   --compare-methods --methods-set week5 (same 6 + tabpfn)
 COMPARE_METHODS_WEEK5 = COMPARE_METHODS + ["tabpfn"]
 
-# Step B: Top-3 from Step A + Deep SVDD (cluster-based, same slot as OCSVM for Week 4)
-FEATURE_BAGGING_METHODS = ["isolation_forest", "knn", "ocsvm", "deep_svdd"]
+# Week 5, Step 2: feature bagging restricted to isolation_forest only
+# (see module docstring for why).
+FEATURE_BAGGING_METHODS = ["isolation_forest"]
 
 
 def load_data():
@@ -736,21 +743,34 @@ def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=2
 def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repeats=25,
                                       n_subsets=10, subset_min_frac=0.5,
                                       inlier_frac=0.8, outlier_frac=0.8, verbose=True):
-	# Step B, full repeated-subsampling version (see chat notes: this means
-	# n_subsets extra fits INSIDE every single repeat, so total fits per
-	# method = n_repeats * n_subsets, e.g. 25*10=250, x3 methods = 750).
-	# Same 80/20 split logic as Step A; scale+reduce fit on the train split
-	# only, applied to val with the same fit (no leakage). Replaces the old
-	# single full-train post-hoc check - this version gives a proper
-	# mean +/- std across repeats instead of one point estimate.
+	# Step B, full repeated-subsampling version. Same 80/20 split logic as
+	# Step A; scale+reduce fit on the train split only, applied to val with
+	# the same fit (no leakage).
+	#
+	# Week 5, Step 2: two new aggregation variants alongside sum/max/aom:
+	#   - pruned: drop the subsets least correlated with the ensemble
+	#     consensus (mean of all z-normalized subset scores) before
+	#     averaging the rest. No labels used - purely an unsupervised proxy
+	#     for "this subset disagrees with the group".
+	#   - damped: clip z-normalized scores to [-3, 3] before averaging, so
+	#     one subset with an extreme, badly-calibrated score range can't
+	#     dominate the sum/average.
 	if getattr(args, "feature_select", None) or getattr(args, "smote", False):
 		raise ValueError("feature bagging repeated subsampling doesn't support --feature-select/--smote")
+	if getattr(args, "subspace_method", "random") == "vgan":
+		raise NotImplementedError(
+			"--subspace-method vgan is not wired up yet (next step) - "
+			"only 'random' (the default, unchanged from before) works right now."
+		)
 
 	y = np.asarray(train_labels == "active", dtype=int)
 	inlier_idx_all = np.where(y == 0)[0]
 	outlier_idx_all = np.where(y == 1)[0]
 
-	repeat_results = {"no_bagging": [], "bagging_sum": [], "bagging_max": [], "bagging_aom": []}
+	repeat_results = {
+		"no_bagging": [], "bagging_sum": [], "bagging_max": [], "bagging_aom": [],
+		"bagging_pruned": [], "bagging_damped": [],
+	}
 
 	for i in range(n_repeats):
 		train_idx, val_idx = _repeated_split_indices(
@@ -803,15 +823,33 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 		groups = np.array_split(subset_matrix, n_groups, axis=0)
 		agg_aom = np.mean([g.max(axis=0) for g in groups], axis=0)
 
+		# pruned: keep only the top half of subsets most correlated with
+		# the ensemble consensus (mean of all z-normalized subset scores),
+		# then average those.
+		consensus = subset_matrix.mean(axis=0)
+		correlations = np.array([
+			np.corrcoef(subset_matrix[s], consensus)[0, 1] for s in range(n_subsets)
+		])
+		keep_mask = correlations >= np.median(correlations)
+		agg_pruned = subset_matrix[keep_mask].mean(axis=0)
+
+		# damped: clip each subset's z-scores to [-3, 3] before averaging.
+		damped_matrix = np.clip(subset_matrix, -3, 3)
+		agg_damped = damped_matrix.mean(axis=0)
+
 		repeat_results["bagging_sum"].append(roc_auc_score(y_val, agg_sum))
 		repeat_results["bagging_max"].append(roc_auc_score(y_val, agg_max))
 		repeat_results["bagging_aom"].append(roc_auc_score(y_val, agg_aom))
+		repeat_results["bagging_pruned"].append(roc_auc_score(y_val, agg_pruned))
+		repeat_results["bagging_damped"].append(roc_auc_score(y_val, agg_damped))
 
 		if verbose:
 			print(f"  repeat {i+1}/{n_repeats}: no_bagging={repeat_results['no_bagging'][-1]:.4f}  "
 			      f"sum={repeat_results['bagging_sum'][-1]:.4f}  "
 			      f"max={repeat_results['bagging_max'][-1]:.4f}  "
-			      f"aom={repeat_results['bagging_aom'][-1]:.4f}")
+			      f"aom={repeat_results['bagging_aom'][-1]:.4f}  "
+			      f"pruned={repeat_results['bagging_pruned'][-1]:.4f}  "
+			      f"damped={repeat_results['bagging_damped'][-1]:.4f}")
 
 	if not repeat_results["no_bagging"]:
 		raise ValueError("Feature bagging repeated subsampling produced no valid repeats")
@@ -822,7 +860,7 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 			"mean": float(np.mean(vals)),
 			"std": float(np.std(vals, ddof=1)),
 			"n": len(vals),
-			"values": vals,  # raw per-repeat AUCs, needed for the CSV export (12-column matrix)
+			"values": vals,  # raw per-repeat AUCs, needed for the CSV export
 		}
 	return summary
 
@@ -850,30 +888,30 @@ def feature_bagging_comparison(X_train, train_labels, args):
 			n_repeats=args.n_repeats, n_subsets=args.n_subsets, verbose=False,
 		)
 		for key, stats_ in rows[method].items():
-			print(f"  {key:<12} {stats_['mean']:.4f} +/- {stats_['std']:.4f}  ({stats_['n']} repeats)")
+			print(f"  {key:<15} {stats_['mean']:.4f} +/- {stats_['std']:.4f}  ({stats_['n']} repeats)")
 		print()
 
 	print("=" * 60)
 	print("FEATURE BAGGING SUMMARY (mean +/- std over repeats)")
 	print("no_bagging = single model on all components (Step A baseline)")
 	print("=" * 60)
-	header = f"{'method':<18}" + "".join(f"{k:>20}" for k in ["no_bagging", "sum", "max", "aom"])
+	variant_keys = ["no_bagging", "bagging_sum", "bagging_max", "bagging_aom",
+	                 "bagging_pruned", "bagging_damped"]
+	variant_labels = ["no_bagging", "sum", "max", "aom", "pruned", "damped"]
+	header = f"{'method':<18}" + "".join(f"{k:>16}" for k in variant_labels)
 	print(header)
 	for method in FEATURE_BAGGING_METHODS:
 		r = rows[method]
 		line = f"{method:<18}"
-		for key in ["no_bagging", "bagging_sum", "bagging_max", "bagging_aom"]:
-			line += f"{r[key]['mean']:>12.4f}+/-{r[key]['std']:.4f}"
+		for key in variant_keys:
+			line += f"{r[key]['mean']:>10.4f}+/-{r[key]['std']:.4f}"
 		print(line)
 	print("=" * 60 + "\n")
 
 	if getattr(args, "output_csv", None):
-		# 12 columns: 3 methods x 4 aggregation variants (no_bagging/sum/max/aom),
-		# one row per repeat - for a statistical test comparing all 12
-		# method+aggregation configurations against each other (separate
-		# question from the --compare-methods 5-method test above).
-		variant_keys = ["no_bagging", "bagging_sum", "bagging_max", "bagging_aom"]
-		variant_labels = ["no_bagging", "sum", "max", "aom"]
+		# len(FEATURE_BAGGING_METHODS) x 6 aggregation variants, one row per
+		# repeat - for a statistical test comparing all method+aggregation
+		# configurations against each other.
 		columns = {}
 		for method in FEATURE_BAGGING_METHODS:
 			for key, label in zip(variant_keys, variant_labels):
@@ -1068,10 +1106,7 @@ def compare_methods(X_train, train_labels, args):
 	# --eval-strategy - this comparison mode is separate from the single-
 	# method CV/repeated_subsampling choice above. If --output-csv is set,
 	# also writes the matrix to disk - this is one of the two direct
-	# inputs for --stat-test (Friedman/Conover-Iman, Week 4): 25 rows
-	# (repeats/blocks) x N columns (methods, no-bagging AUC only -
-	# Feature Bagging variants are a separate question, see
-	# feature_bagging_comparison above).
+	# inputs for --stat-test (Friedman/Conover-Iman, Week 4).
 	#
 	# Week 5: defaults to the original 6-method COMPARE_METHODS (unchanged,
 	# so the Week 4 comparison stays reproducible), but --methods-set lets
@@ -1135,8 +1170,7 @@ def friedman_conover_test(matrix, alpha=0.05):
 	# Week 4: Friedman test (global, paired/blocked design - rows=repeats
 	# are the blocks, columns=configurations are the groups) followed by,
 	# if significant, Conover-Iman post-hoc (pairwise). This is generic
-	# over the column set - works the same whether columns are the 5
-	# --compare-methods methods or the 12 --feature-bagging configurations.
+	# over the column set.
 	# Returns (friedman_stat, friedman_p, conover_pvals_or_None, sig_table_or_None).
 	stat, p = stats.friedmanchisquare(*[matrix[c] for c in matrix.columns])
 
@@ -1181,9 +1215,7 @@ def friedman_conover_test(matrix, alpha=0.05):
 			elif not row_higher:
 				sig_table.loc[row, col] = "-"
 			# else: numerically higher but not significant at either
-			# threshold - cell stays blank (original Week 3/4 convention,
-			# kept on request rather than the "always fill with -" fix
-			# discussed in chat).
+			# threshold - cell stays blank (original Week 3/4 convention).
 
 	print("=" * 60)
 	print("SIGNIFICANCE TABLE (row vs column)")
@@ -1198,8 +1230,7 @@ def friedman_conover_test(matrix, alpha=0.05):
 
 def run_statistical_test(args):
 	# Entry point for --stat-test: reads any repeats x configurations AUC
-	# matrix CSV (from --compare-methods --output-csv or --feature-bagging
-	# --output-csv) and runs friedman_conover_test on it. Doesn't need
+	# matrix CSV and runs friedman_conover_test on it. Doesn't need
 	# X_train/X_test/train_labels at all, so main() must call this BEFORE
 	# load_data() to skip the (slow) parquet loading entirely.
 	print("=" * 60)
@@ -1241,33 +1272,31 @@ def main():
 	                          "6-method COMPARE_METHODS (Week 4 behavior, unchanged).")
 	parser.add_argument("--output-csv", type=str, default=None,
 	                     help="Save repeats x configurations AUC matrix to this CSV path. With "
-	                          "--compare-methods: 5 columns, no-bagging AUC only. With "
-	                          "--feature-bagging: 12 columns (3 methods x 4 aggregation "
-	                          "variants: no_bagging/sum/max/aom). With --stat-test: saves the "
-	                          "resulting ++/+/- significance table instead of an AUC matrix.")
+	                          "--stat-test: saves the resulting ++/+/- significance table instead.")
 	parser.add_argument("--feature-bagging", action="store_true",
 	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
 	                          f"repeated subsampling (--n-repeats) with --n-subsets random "
 	                          f"feature subsets fit INSIDE each repeat, compare no_bagging vs "
-	                          f"sum/max/aom aggregation. Total fits per method = n_repeats * "
-	                          f"n_subsets (e.g. 25*10=250, x3 methods=750). "
-	                          f"Overrides --method/--compare-methods.")
+	                          f"sum/max/aom/pruned/damped aggregation. Total fits per method = "
+	                          f"n_repeats * n_subsets. Overrides --method/--compare-methods.")
 	parser.add_argument("--n-subsets", type=int, default=10,
 	                     help="Number of random feature subsets per repeat for --feature-bagging")
+	parser.add_argument("--subspace-method", type=str, default="random",
+	                     choices=["random", "vgan"],
+	                     help="Week 5 Step 2: how --feature-bagging picks feature subsets. "
+	                          "'random' (default, unchanged from before) or 'vgan' "
+	                          "(V-GAN-generated subspaces).")
 	parser.add_argument("--heterogeneous-ensemble", action="store_true",
 	                     help=f"Step C: {FEATURE_BAGGING_METHODS} on the SAME full feature "
 	                          f"space (no subspace split, opposite of --feature-bagging), "
 	                          f"repeated subsampling (--n-repeats), scores z-normalized and "
-	                          f"combined via sum/max/rank-averaging each repeat. Total fits = "
-	                          f"n_repeats * 3 methods (e.g. 25*3=75). "
+	                          f"combined via sum/max/rank-averaging each repeat. "
 	                          f"Overrides --method/--compare-methods/--feature-bagging.")
 	parser.add_argument("--stat-test", type=str, default=None,
-	                     help="Week 4: path to a repeats x configurations AUC matrix CSV "
-	                          "(from --compare-methods --output-csv or --feature-bagging "
-	                          "--output-csv). Runs a Friedman test, then (if significant) "
-	                          "Conover-Iman post-hoc, and prints a ++/+/- significance table. "
-	                          "Save the table with --output-csv. Skips data loading entirely - "
-	                          "overrides all other modes.")
+	                     help="Week 4: path to a repeats x configurations AUC matrix CSV. "
+	                          "Runs a Friedman test, then (if significant) Conover-Iman "
+	                          "post-hoc, and prints a ++/+/- significance table. Save the "
+	                          "table with --output-csv. Skips data loading entirely.")
 	parser.add_argument("--alpha", type=float, default=0.05,
 	                     help="Significance level for --stat-test's Friedman test")
 	parser.add_argument("--n-estimators", type=int, default=200,
