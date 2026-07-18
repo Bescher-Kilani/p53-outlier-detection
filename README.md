@@ -28,6 +28,10 @@ p53mutant/
 ├── mrmr_ifs.py                # mRMR+IFS feature selector (Week 2, exploratory, see below)
 ├── pca_2d_3d_blocks.py        # separate PCA on 2D/3D feature blocks (Week 3, see below)
 ├── pca_2d_3d_blocks_cv.py     # CV check for the block-PCA representation (Week 3)
+├── benchmark_deep_svdd_week4.py # Deep SVDD comparison (Week 4, see below)
+├── vgan_lib/                  # bundled V-GAN source (Week 5, see below), not a PyPI package
+│   ├── vgan.py
+│   └── models/
 └── notbooks/
     └── data_expolartion.ipynb # exploration & correlation/PCA plots only,
                                 # not required to run the pipeline
@@ -47,6 +51,13 @@ cd p53mutant
 bash setup.sh
 source venv/bin/activate
 ```
+
+**Week 5 additions:** TabPFN's model weights are gated on HuggingFace —
+before first use, accept the license at
+https://huggingface.co/Prior-Labs/tabpfn_3 and run `hf auth login` (or set
+`HF_TOKEN`). V-GAN's `torch-two-sample` dependency isn't on PyPI and needs
+`pip install --no-build-isolation "git+https://github.com/josipd/torch-two-sample.git"`
+(same numpy-not-visible-during-build issue as the `gmd` workaround below).
 
 ## Reproducing the pipeline
 
@@ -537,3 +548,192 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 Use **max** aggregation when reading Step B output (`isolation_forest_max` column in
 `outputs/auc_feature_bagging_matrix.csv`). Labels are for evaluation only — never
 passed into `.fit()`.
+
+## Week 5 — key findings
+
+Course topic: Outlier Ensembles. Three steps this week: (1) add new OD
+methods and re-run the Step A comparison, (2) revisit feature bagging with
+two new aggregation variants and compare subspace sources (random vs.
+V-GAN-generated), (3) revisit the heterogeneous ensemble with the same new
+aggregation variants.
+
+### Step 1 — new OD methods
+
+**TabPFN** (`--method tabpfn`) added: a zero-shot tabular foundation model,
+repurposed for unsupervised OD via Prior Labs' `TabPFNUnsupervisedModel`
+(estimates per-sample likelihood; low likelihood = anomalous). `fit(X)`
+only, no labels — fits the OCC rule as-is, no adaptation needed. Model
+weights are gated on HuggingFace (`hf auth login` required once per
+machine).
+
+**Result — TabPFN vs. all 6 methods from last week** (25 repeats, PCA-147):
+
+| Method | AUC | 
+|--------|-----|
+| Isolation Forest | **0.7248 ± 0.0227** |
+| TabPFN | 0.7049 ± 0.0307 |
+| KNN | 0.6997 ± 0.0205 |
+| Deep SVDD | 0.6981 ± 0.0351 |
+| OCSVM | 0.6860 ± 0.0175 |
+| ABOD | 0.6494 ± 0.0195 |
+| LOF | 0.5067 ± 0.0227 |
+
+Friedman chi-square = 117.29, p ≈ 0.0000 → H0 rejected.
+
+**Significance table (row significantly better than column):**
+
+|                  | isolation_forest | lof | knn | ocsvm | abod | deep_svdd | tabpfn |
+|------------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| isolation_forest |     | ++  | ++  | ++  | ++  | ++  | ++  |
+| lof              | -   |     | -   | -   | -   | -   | -   |
+| knn              | -   | ++  |     | ++  | ++  |     | -   |
+| ocsvm            | -   | ++  | -   |     | ++  | -   | -   |
+| abod             | -   | ++  | -   | -   |     | -   | -   |
+| deep_svdd        | -   | ++  |     | ++  | ++  |     | -   |
+| tabpfn           | -   | ++  | ++  | ++  | ++  | ++  |     |
+
+Isolation Forest significantly beats every other method (incl. TabPFN,
+p = 0.0102). TabPFN is a genuine second contender despite zero tuning:
+significantly ahead of LOF/OCSVM/ABOD/Deep SVDD, and not significantly
+different from KNN.
+
+**Top-3 carried forward to Step 3: Isolation Forest, TabPFN, KNN.**
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --compare-methods --methods-set week5 --reduce pca --n-components 147 \
+    --output-csv outputs/week5_compare.csv
+python p53_od_pipeline.py --stat-test outputs/week5_compare.csv \
+    --output-csv outputs/week5_significance.csv
+```
+
+### Step 2 — feature bagging: new aggregations + subspace source (Isolation Forest only)
+
+Restricted to Isolation Forest only this step — feature bagging costs
+`n_repeats x n_subsets` fits, too expensive for TabPFN at 25 repeats. Two
+new aggregation variants added alongside sum/max/aom:
+- **Pruned:** drop the feature subsets least correlated with the ensemble
+  consensus (mean of all z-normalized subset scores) before averaging the
+  rest.
+- **Damped:** clip each subset's z-normalized scores to [-3, 3] before
+  averaging, so one subset with an extreme, badly-calibrated score range
+  can't dominate.
+
+Subspace source compared via `--subspace-method`: **random** (unchanged
+from Weeks 3/4) vs. **V-GAN with kernel learning** (Cribeiro-Ramallo et al.
+2025, "Adversarial Subspace Generation for Outlier Detection in
+High-Dimensional Data" — source bundled locally under `vgan_lib/`, no PyPI
+package; needs `torch-two-sample`, also not on PyPI, installed with
+`--no-build-isolation` same as the `gmd` workaround). One bug fixed in the
+bundled source: `float(tensor.to('cpu').numpy())` crashed with
+`TypeError: only 0-dimensional arrays can be converted to Python scalars`
+on our torch/numpy versions — fixed by switching to `tensor.item()`.
+
+**Results (25 repeats, PCA-147; `no_bagging` = 0.7249 ± 0.0226 baseline,
+identical for both subspace sources — confirms consistent splits):**
+
+| Subspace source | Sum | Max | AOM | Pruned | Damped |
+|---|---|---|---|---|---|
+| Random | 0.7310 ± 0.0195 | 0.7308 ± 0.0206 | **0.7314 ± 0.0197** | 0.7298 ± 0.0198 | 0.7310 ± 0.0195 |
+| V-GAN, kernel learning (50 epochs) | 0.7282 ± 0.0206 | 0.7289 ± 0.0212 | **0.7295 ± 0.0209** | 0.7227 ± 0.0200 | 0.7283 ± 0.0206 |
+
+Random: Friedman p = 0.00007, sum/max/aom/pruned/damped all significantly
+beat `no_bagging`, not significantly different from each other.
+
+**Random significance table:**
+
+| | no_bagging | sum | max | aom | pruned | damped |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| no_bagging |  | - | - | - | - | - |
+| sum | ++ |  |  | - |  | - |
+| max | ++ | - |  | - |  | - |
+| aom | ++ |  | + |  | ++ |  |
+| pruned | ++ | - | - | - |  | - |
+| damped | ++ |  |  | - | ++ |  |
+
+**V-GAN (kernel learning) significance table:** Friedman p = 0.00035.
+
+| | no_bagging | sum | max | aom | pruned | damped |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| no_bagging |  |  |  |  | + |  |
+| sum |  |  |  |  | ++ |  |
+| max |  |  |  |  | ++ |  |
+| aom | ++ | ++ |  |  | ++ |  |
+| pruned | - | - | - | - |  | - |
+| damped |  |  |  | ++ | ++ |  |
+
+Only `aom` significantly beats `no_bagging` (p = 0.0037); `pruned` is the
+only aggregation across the whole Step 2 sweep that lands *below*
+`no_bagging` (not significant, p = 0.061). The detector loss was frozen
+at an identical value across dozens of epochs during training — the
+adversarial game had already stalled, so V-GAN's kernel-learning subspaces
+did not translate into a real advantage here. **Random subspaces remain
+the recommended choice** — simpler, no extra dependency, and numerically
+ahead of V-GAN (kernel learning) on every aggregation.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 \
+    --output-csv outputs/week5_feature_bagging.csv
+python p53_od_pipeline.py --feature-bagging --subspace-method vgan_kernel --vgan-epochs 50 \
+    --reduce pca --n-components 147 --output-csv outputs/week5_fb_vgan_kernel_50ep_full.csv
+python p53_od_pipeline.py --stat-test outputs/week5_feature_bagging.csv \
+    --output-csv outputs/week5_feature_bagging_significance.csv
+```
+
+### Step 3 — heterogeneous ensemble: Top-3 from Step 1
+
+`isolation_forest`, `tabpfn`, `knn` (Step 1's Top-3) combined on the same
+full 147-dim. feature space (no subspace split — opposite of Step 2).
+Same aggregation recipe as Step 2, with `aom` swapped back for
+**rank-averaging** (as in Weeks 3/4, `aom` doesn't apply meaningfully with
+only 3 candidates): sum, max, rank-avg, pruned, damped.
+
+| | AUC |
+|---|-----|
+| Isolation Forest (alone) | **0.7249 ± 0.0226** |
+| TabPFN (alone) | 0.7036 ± 0.0286 |
+| KNN (alone) | 0.6997 ± 0.0205 |
+| Ensemble (sum) | 0.7144 ± 0.0212 |
+| Ensemble (max) | 0.7130 ± 0.0188 |
+| Ensemble (rank avg) | 0.7182 ± 0.0210 |
+| Ensemble (pruned) | 0.7160 ± 0.0210 |
+| Ensemble (damped) | 0.7144 ± 0.0212 |
+
+Friedman chi-square = 72.91, p ≈ 0.0000 → H0 rejected. **Same negative
+result as Weeks 3/4's Step C, confirmed again with a stronger Top-3:**
+Isolation Forest alone significantly beats every ensemble variant except
+rank-averaging (not significantly different, p = 0.30) — and
+rank-averaging is itself significantly better than sum/max/pruned/damped
+(p ≤ 0.019 against each). Mixing in the weaker TabPFN/KNN drags the
+combination down rather than adding complementary signal; only
+rank-averaging manages to tie the best single method, never beat it.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --heterogeneous-ensemble --reduce pca --n-components 147 \
+    --output-csv outputs/week5_heterogeneous_ensemble.csv
+python p53_od_pipeline.py --stat-test outputs/week5_heterogeneous_ensemble.csv \
+    --output-csv outputs/week5_heterogeneous_ensemble_significance.csv
+```
+
+### Week 5 best (OCC deliverable)
+
+TabPFN turned out to be a genuine, competitive contender — but does not
+beat the simpler Week 4 winner. V-GAN (kernel learning) did not improve
+on random subspaces either. The recommended configuration is unchanged
+from Week 4:
+
+| Rank | Configuration | AUC | Why |
+|------|---------------|-----|-----|
+| **1 (use this)** | **Isolation Forest + PCA (147) + StandardScaler + feature bagging (AOM, random subspaces)** | **0.7314 ± 0.0197** | Best result across all of Step 2/3; simpler than V-GAN, no extra dependency |
+| 2 | Isolation Forest + PCA (147) + scale (no bagging) | 0.7248 ± 0.0227 | Best single detector; simpler still |
+| 3 | TabPFN (zero-shot, no tuning) | 0.7049 ± 0.0307 | Best non-IF single method; genuine second contender for future work |
+| — | Heterogeneous ensemble (IF + TabPFN + KNN, any aggregation) | 0.7130–0.7182 | Below IF alone — do not use |
+
+**Pipeline command for the Week 5 recommendation (same as Week 4):**
+
+```bash
+python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 147 \
+    --feature-bagging --n-repeats 25 --n-subsets 10
+```
