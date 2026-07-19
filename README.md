@@ -566,6 +566,7 @@ only, no labels — fits the OCC rule as-is, no adaptation needed. Model
 weights are gated on HuggingFace (`hf auth login` required once per
 machine).
 
+
 **Result — TabPFN vs. all 6 methods from last week** (25 repeats, PCA-147):
 
 | Method | AUC | 
@@ -585,12 +586,12 @@ Friedman chi-square = 117.29, p ≈ 0.0000 → H0 rejected.
 |                  | isolation_forest | lof | knn | ocsvm | abod | deep_svdd | tabpfn |
 |------------------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | isolation_forest |     | ++  | ++  | ++  | ++  | ++  | ++  |
-| lof              | -   |     | -   | -   | -   | -   | -   |
-| knn              | -   | ++  |     | ++  | ++  |     | -   |
-| ocsvm            | -   | ++  | -   |     | ++  | -   | -   |
-| abod             | -   | ++  | -   | -   |     | -   | -   |
-| deep_svdd        | -   | ++  |     | ++  | ++  |     | -   |
-| tabpfn           | -   | ++  | ++  | ++  | ++  | ++  |     |
+| lof              | --  |     | --  | --  | --  | --  | --  |
+| knn              | --  | ++  |     | ++  | ++  |     | --  |
+| ocsvm            | --  | ++  | --  |     | ++  | --  | --  |
+| abod             | --  | ++  | --  | --  |     | --  | --  |
+| deep_svdd        | --  | ++  |     | ++  | ++  |     | --  |
+| tabpfn           | --  | ++  | ++  | ++  | ++  | ++  |     |
 
 Isolation Forest significantly beats every other method (incl. TabPFN,
 p = 0.0102). TabPFN is a genuine second contender despite zero tuning:
@@ -638,38 +639,42 @@ identical for both subspace sources — confirms consistent splits):**
 | V-GAN, kernel learning (50 epochs) | 0.7282 ± 0.0206 | 0.7289 ± 0.0212 | **0.7295 ± 0.0209** | 0.7227 ± 0.0200 | 0.7283 ± 0.0206 |
 
 Random: Friedman p = 0.00007, sum/max/aom/pruned/damped all significantly
-beat `no_bagging`, not significantly different from each other.
+beat `no_bagging`. Among the five aggregations, aom and damped edge out
+pruned specifically (both significantly better, `--`/`++`), while the
+rest are not significantly different from each other.
 
 **Random significance table:**
 
 | | no_bagging | sum | max | aom | pruned | damped |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| no_bagging |  | - | - | - | - | - |
-| sum | ++ |  |  | - |  | - |
-| max | ++ | - |  | - |  | - |
+| no_bagging |  | -- | -- | -- | -- | -- |
+| sum | ++ |  |  |  |  |  |
+| max | ++ |  |  | - |  |  |
 | aom | ++ |  | + |  | ++ |  |
-| pruned | ++ | - | - | - |  | - |
-| damped | ++ |  |  | - | ++ |  |
+| pruned | ++ |  |  | -- |  | -- |
+| damped | ++ |  |  |  | ++ |  |
 
 **V-GAN (kernel learning) significance table:** Friedman p = 0.00035.
 
 | | no_bagging | sum | max | aom | pruned | damped |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| no_bagging |  |  |  |  | + |  |
-| sum |  |  |  |  | ++ |  |
+| no_bagging |  |  |  | -- | + |  |
+| sum |  |  |  | -- | ++ |  |
 | max |  |  |  |  | ++ |  |
 | aom | ++ | ++ |  |  | ++ |  |
-| pruned | - | - | - | - |  | - |
-| damped |  |  |  | ++ | ++ |  |
+| pruned | - | -- | -- | -- |  | -- |
+| damped |  |  |  |  | ++ |  |
 
 Only `aom` significantly beats `no_bagging` (p = 0.0037); `pruned` is the
 only aggregation across the whole Step 2 sweep that lands *below*
-`no_bagging` (not significant, p = 0.061). The detector loss was frozen
-at an identical value across dozens of epochs during training — the
-adversarial game had already stalled, so V-GAN's kernel-learning subspaces
-did not translate into a real advantage here. **Random subspaces remain
-the recommended choice** — simpler, no extra dependency, and numerically
-ahead of V-GAN (kernel learning) on every aggregation.
+`no_bagging`, and here that gap is itself marginally significant
+(p = 0.061, `no_bagging` row vs. `pruned` column = `+`). The detector
+loss was frozen at an identical value across dozens of epochs during
+training — the adversarial game had already stalled, so V-GAN's
+kernel-learning subspaces did not translate into a real advantage here.
+**Random subspaces remain the recommended choice** — simpler, no extra
+dependency, and numerically ahead of V-GAN (kernel learning) on every
+aggregation.
 
 Reproduce:
 ```bash
@@ -702,12 +707,29 @@ only 3 candidates): sum, max, rank-avg, pruned, damped.
 
 Friedman chi-square = 72.91, p ≈ 0.0000 → H0 rejected. **Same negative
 result as Weeks 3/4's Step C, confirmed again with a stronger Top-3:**
-Isolation Forest alone significantly beats every ensemble variant except
-rank-averaging (not significantly different, p = 0.30) — and
-rank-averaging is itself significantly better than sum/max/pruned/damped
-(p ≤ 0.019 against each). Mixing in the weaker TabPFN/KNN drags the
-combination down rather than adding complementary signal; only
-rank-averaging manages to tie the best single method, never beat it.
+numerically, Isolation Forest alone (0.7249) beats every ensemble
+variant (0.7130–0.7182) — mixing in the weaker TabPFN/KNN drags the
+combination down rather than adding complementary signal. Testing the
+five aggregation variants directly against each other (below) confirms
+rank-averaging is the clear winner among them.
+
+**Significance table (aggregation variants only):**
+
+| | sum | max | rank_avg | pruned | damped |
+|---|:---:|:---:|:---:|:---:|:---:|
+| sum |  |  | -- | -- |  |
+| max |  |  | -- |  |  |
+| rank_avg | ++ | ++ |  | ++ | ++ |
+| pruned | ++ |  | -- |  |  |
+| damped |  |  | -- |  |  |
+
+Rank-averaging significantly beats every other aggregation (sum, max,
+pruned, damped); pruned is significantly better than sum but not
+significantly different from max or damped. Rank-averaging's robustness
+to the different score distributions of Isolation Forest/TabPFN/KNN (a
+tree ensemble, a likelihood estimate, and a distance-based method — all
+on very different native scales) is the most plausible reason it holds
+up better than the other four aggregations here.
 
 Reproduce:
 ```bash

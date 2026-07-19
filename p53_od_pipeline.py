@@ -292,7 +292,7 @@ class TabPFNDetector(BaseEstimator):
 		#
 		# Non-finite values: extremely atypical points can underflow the
 		# log-density to -inf/nan, which crashes roc_auc_score. Remap to
-		# just outside this batch's own finite range (preserves ranking;
+		# just outside each batch's own finite range (preserves ranking;
 		# -inf/nan -> most anomalous, +inf -> most normal) instead of a
 		# fixed constant.
 		finite = scores[np.isfinite(scores)]
@@ -979,20 +979,32 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 
 
 def feature_bagging_comparison(X_train, train_labels, args):
-	# Runs feature_bagging_repeated_metrics separately for each of
-	# FEATURE_BAGGING_METHODS (no mixing of method and subspace across
+	# Runs feature_bagging_repeated_metrics separately for each method in
+	# the resolved method list (no mixing of method and subspace across
 	# methods), prints per-method mean +/- std plus a summary table.
-	total_fits = args.n_repeats * args.n_subsets * len(FEATURE_BAGGING_METHODS)
+	#
+	# Method list resolution: --bagging-methods overrides the
+	# FEATURE_BAGGING_METHODS default (isolation_forest only) with a
+	# comma-separated list, to try a different method (or subset) before
+	# deciding whether to widen FEATURE_BAGGING_METHODS itself. Default
+	# (no flag) stays exactly Week 5 Step 2's behavior.
+	raw_bagging_methods = getattr(args, "bagging_methods", None)
+	if raw_bagging_methods:
+		methods = [m.strip() for m in raw_bagging_methods.split(",") if m.strip()]
+	else:
+		methods = FEATURE_BAGGING_METHODS
+
+	total_fits = args.n_repeats * args.n_subsets * len(methods)
 	print("="*60)
-	print(f"FEATURE BAGGING (repeated subsampling): {', '.join(FEATURE_BAGGING_METHODS)}")
+	print(f"FEATURE BAGGING (repeated subsampling): {', '.join(methods)}")
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
 	      f"n_repeats={args.n_repeats}, n_subsets={args.n_subsets})")
 	print(f"Total fits: {args.n_repeats} repeats x {args.n_subsets} subsets x "
-	      f"{len(FEATURE_BAGGING_METHODS)} methods = {total_fits}")
+	      f"{len(methods)} methods = {total_fits}")
 	print("="*60 + "\n")
 
 	rows = {}
-	for method in FEATURE_BAGGING_METHODS:
+	for method in methods:
 		print("#" * 60)
 		print(f"# METHOD: {method}")
 		print("#" * 60)
@@ -1013,7 +1025,7 @@ def feature_bagging_comparison(X_train, train_labels, args):
 	variant_labels = ["no_bagging", "sum", "max", "aom", "pruned", "damped"]
 	header = f"{'method':<18}" + "".join(f"{k:>16}" for k in variant_labels)
 	print(header)
-	for method in FEATURE_BAGGING_METHODS:
+	for method in methods:
 		r = rows[method]
 		line = f"{method:<18}"
 		for key in variant_keys:
@@ -1022,11 +1034,11 @@ def feature_bagging_comparison(X_train, train_labels, args):
 	print("=" * 60 + "\n")
 
 	if getattr(args, "output_csv", None):
-		# len(FEATURE_BAGGING_METHODS) x 6 aggregation variants, one row per
+		# len(methods) x 6 aggregation variants, one row per
 		# repeat - for a statistical test comparing all method+aggregation
 		# configurations against each other.
 		columns = {}
-		for method in FEATURE_BAGGING_METHODS:
+		for method in methods:
 			for key, label in zip(variant_keys, variant_labels):
 				columns[f"{method}_{label}"] = rows[method][key]["values"]
 
@@ -1042,7 +1054,7 @@ def feature_bagging_comparison(X_train, train_labels, args):
 		matrix.to_csv(args.output_csv)
 		print(f"Saved feature bagging AUC matrix to {args.output_csv} "
 		      f"({matrix.shape[0]} rows x {matrix.shape[1]} columns: "
-		      f"{len(FEATURE_BAGGING_METHODS)} methods x {len(variant_labels)} aggregations)\n")
+		      f"{len(methods)} methods x {len(variant_labels)} aggregations)\n")
 
 
 def heterogeneous_ensemble_repeated_metrics(X_train, train_labels, args, methods, n_repeats=25,
@@ -1360,10 +1372,19 @@ def friedman_conover_test(matrix, alpha=0.05):
 	print(pvals.round(4).to_string())
 	print("=" * 60 + "\n")
 
-	# Significance table convention (Week 4 slides):
-	#   "++" : p<=0.05 and mean(row) > mean(column)
-	#   "+"  : p<=0.10 and mean(row) > mean(column)
-	#   "-"  : mean(row) <= mean(column), not significant either way
+	# Significance table, symmetric 4-symbol scheme (chat fix, replaces the
+	# old asymmetric Week 3/4 convention which only had ++/+/- - blank
+	# cells and a collapsed "-" meant "row not better" covered both
+	# "column significantly better" and "no significant difference",
+	# losing information and behaving inconsistently between the two
+	# directions of the same pair). Now every pair gets a mirrored
+	# annotation:
+	#   "++" : p<=0.05, row significantly better than column
+	#   "+"  : p<=0.10 (but >0.05), row better than column
+	#   "--" : p<=0.05, row significantly WORSE than column (mirror of ++)
+	#   "-"  : p<=0.10 (but >0.05), row worse than column (mirror of +)
+	#   ""   : p>0.10, not significant either way (regardless of which is
+	#          numerically higher)
 	means = matrix.mean()
 	configs = matrix.columns
 	sig_table = pd.DataFrame("", index=configs, columns=configs)
@@ -1373,19 +1394,18 @@ def friedman_conover_test(matrix, alpha=0.05):
 				continue
 			p_ij = pvals.loc[row, col]
 			row_higher = means[row] > means[col]
-			if p_ij <= 0.05 and row_higher:
-				sig_table.loc[row, col] = "++"
-			elif p_ij <= 0.10 and row_higher:
-				sig_table.loc[row, col] = "+"
-			elif not row_higher:
-				sig_table.loc[row, col] = "-"
-			# else: numerically higher but not significant at either
-			# threshold - cell stays blank (original Week 3/4 convention).
+			if p_ij <= 0.05:
+				sig_table.loc[row, col] = "++" if row_higher else "--"
+			elif p_ij <= 0.10:
+				sig_table.loc[row, col] = "+" if row_higher else "-"
+			# else: p > 0.10, not significant - cell stays blank regardless
+			# of which mean happens to be numerically higher.
 
 	print("=" * 60)
 	print("SIGNIFICANCE TABLE (row vs column)")
-	print("++ : p<=0.05, row significantly better | + : p<=0.10, row better")
-	print("-  : row not better (numerically worse or equal)")
+	print("++ : p<=0.05, row significantly better  | +  : p<=0.10, row better")
+	print("-- : p<=0.05, row significantly worse   | -  : p<=0.10, row worse")
+	print("(blank: p>0.10, not significant either way)")
 	print("=" * 60)
 	print(sig_table.to_string())
 	print("=" * 60 + "\n")
@@ -1439,11 +1459,17 @@ def main():
 	                     help="Save repeats x configurations AUC matrix to this CSV path. With "
 	                          "--stat-test: saves the resulting ++/+/- significance table instead.")
 	parser.add_argument("--feature-bagging", action="store_true",
-	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately, "
-	                          f"repeated subsampling (--n-repeats) with --n-subsets random "
-	                          f"feature subsets fit INSIDE each repeat, compare no_bagging vs "
+	                     help=f"Step B: for each of {FEATURE_BAGGING_METHODS} separately (or "
+	                          f"--bagging-methods, if given), repeated subsampling "
+	                          f"(--n-repeats) with --n-subsets random feature subsets fit "
+	                          f"INSIDE each repeat, compare no_bagging vs "
 	                          f"sum/max/aom/pruned/damped aggregation. Total fits per method = "
 	                          f"n_repeats * n_subsets. Overrides --method/--compare-methods.")
+	parser.add_argument("--bagging-methods", type=str, default=None,
+	                     help="Comma-separated --method names to override "
+	                          "FEATURE_BAGGING_METHODS for --feature-bagging, e.g. 'knn' or "
+	                          "'isolation_forest,knn'. Default (unset): FEATURE_BAGGING_METHODS "
+	                          "(isolation_forest only, Week 5 Step 2 behavior, unchanged).")
 	parser.add_argument("--n-subsets", type=int, default=10,
 	                     help="Number of random feature subsets per repeat for --feature-bagging")
 	parser.add_argument("--subspace-method", type=str, default="random",
