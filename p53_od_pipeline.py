@@ -101,6 +101,10 @@ COMPARE_METHODS = ["isolation_forest", "lof", "knn", "ocsvm", "abod", "deep_svdd
 #   --compare-methods --methods-set week5 (same 6 + tabpfn)
 COMPARE_METHODS_WEEK5 = COMPARE_METHODS + ["tabpfn"]
 
+# Week 6, Step 1: Neural Networks + Graph-based methods evaluated on the
+# OCC task. LUNAR/DIF move on to HPO.
+COMPARE_METHODS_WEEK6_NEURAL_GRAPH = ["lunar", "dif"]
+
 # Week 5, Step 2: feature bagging restricted to isolation_forest only
 # (see module docstring for why).
 FEATURE_BAGGING_METHODS = ["isolation_forest"]
@@ -110,6 +114,213 @@ FEATURE_BAGGING_METHODS = ["isolation_forest"]
 # whole point here is combining DIFFERENT methods, so this needs its own
 # 3-method list rather than reusing FEATURE_BAGGING_METHODS.
 HETEROGENEOUS_ENSEMBLE_METHODS = ["isolation_forest", "tabpfn", "knn"]
+
+# Week 6, Step 3: final 5 models after HPO.
+COMPARE_METHODS_WEEK6_FINAL = ["isolation_forest", "knn", "deep_svdd", "lunar", "dif"]
+
+# Best params found by --hpo for each of the 5 (dif: best trial so far,
+# search still running at representation_dim=45/n_ensemble=75/n_estimators=10,
+# AUC=0.7166). Used by --compare-methods --tuned via build_hpo_detector.
+TUNED_PARAMS = {
+	"isolation_forest": {"n_estimators": 148, "max_samples": 1.0, "max_features": 1.0},
+	"knn": {"n_neighbors": 50, "method": "largest"},
+	"deep_svdd": {"hidden_neurons": [64, 32], "epochs": 40, "batch_size": 128},
+	"lunar": {"n_neighbours": 9, "n_epochs": 110, "lr": 0.0002912245673897},
+	"dif": {"representation_dim": 45, "n_ensemble": 75, "n_estimators": 10},
+}
+
+# Week 6, Step 2: HPO via Optuna for isolation_forest, knn, deep_svdd,
+# dif, lunar. Each entry is (suggest_fn, resolve_fn): suggest_fn
+# suggests trial params, resolve_fn rebuilds the same kwargs from
+# study.best_params afterwards (for models with categorical arch options).
+_ARCH_OPTIONS_DEEP_SVDD = {"32_16": [32, 16], "64_32": [64, 32], "128_64_32": [128, 64, 32]}
+
+
+def _suggest_params_isolation_forest(trial):
+	return {
+		"n_estimators": trial.suggest_int("n_estimators", 50, 500),
+		"max_samples": trial.suggest_float("max_samples", 0.1, 1.0),
+		"max_features": trial.suggest_float("max_features", 0.3, 1.0),
+	}
+
+
+def _suggest_params_knn(trial):
+	return {
+		"n_neighbors": trial.suggest_int("n_neighbors", 5, 50),
+		"method": trial.suggest_categorical("method", ["largest", "mean", "median"]),
+	}
+
+
+def _suggest_params_deep_svdd(trial):
+	arch = trial.suggest_categorical("hidden_neurons", list(_ARCH_OPTIONS_DEEP_SVDD))
+	return {
+		"hidden_neurons": _ARCH_OPTIONS_DEEP_SVDD[arch],
+		"epochs": trial.suggest_int("epochs", 10, 60),
+		"batch_size": trial.suggest_categorical("batch_size", [128, 256, 512]),
+	}
+
+
+def _resolve_params_deep_svdd(raw):
+	return {
+		"hidden_neurons": _ARCH_OPTIONS_DEEP_SVDD[raw["hidden_neurons"]],
+		"epochs": raw["epochs"],
+		"batch_size": raw["batch_size"],
+	}
+
+
+def _suggest_params_dif(trial):
+	return {
+		"representation_dim": trial.suggest_int("representation_dim", 10, 50),
+		"n_ensemble": trial.suggest_int("n_ensemble", 10, 100),
+		"n_estimators": trial.suggest_int("n_estimators", 3, 10),
+	}
+
+
+def _suggest_params_lunar(trial):
+	return {
+		"n_neighbours": trial.suggest_int("n_neighbours", 3, 20),
+		"n_epochs": trial.suggest_int("n_epochs", 50, 300),
+		"lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+	}
+
+
+def _identity(raw):
+	return dict(raw)
+
+
+HPO_PARAM_SPACES = {
+	"isolation_forest": (_suggest_params_isolation_forest, _identity),
+	"knn": (_suggest_params_knn, _identity),
+	"deep_svdd": (_suggest_params_deep_svdd, _resolve_params_deep_svdd),
+	"dif": (_suggest_params_dif, _identity),
+	"lunar": (_suggest_params_lunar, _identity),
+}
+
+
+def build_hpo_detector(model, params, random_state):
+	if model == "isolation_forest":
+		return IsolationForest(random_state=random_state, n_jobs=-1, **params)
+	if model == "knn":
+		from pyod.models.knn import KNN
+		return PyODAdapter(KNN(n_jobs=-1, **params))
+	if model == "deep_svdd":
+		return DeepSVDDDetector(random_state=random_state, **params)
+	if model == "dif":
+		from pyod.models.dif import DIF
+		return PyODAdapter(DIF(random_state=random_state, **params))
+	if model == "lunar":
+		from pyod.models.lunar import LUNAR
+		return PyODAdapter(LUNAR(random_state=random_state, **params))
+	raise ValueError(f"No HPO search space for {model}. Available: {list(HPO_PARAM_SPACES)}")
+
+
+def run_hpo_single(model, X_train, train_labels, args):
+	# Runs HPO for one model; returns (best_value, best_params, final_metrics).
+	import optuna
+
+	suggest_fn, resolve_fn = HPO_PARAM_SPACES[model]
+
+	sampler = optuna.samplers.GPSampler(seed=args.random_state) if args.hpo_sampler == "gp" \
+		else optuna.samplers.TPESampler(seed=args.random_state)
+	study = optuna.create_study(direction="maximize", sampler=sampler)
+
+	hpo_args = argparse.Namespace(**{**vars(args), "method": model,
+	                                  "feature_select": None, "smote": False})
+
+	print("=" * 60)
+	print(f"HPO: {model}  (sampler={args.hpo_sampler}, trials={args.hpo_trials}, "
+	      f"repeats_per_trial={args.hpo_repeats})")
+	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale})")
+	print("=" * 60 + "\n")
+
+	def objective(trial):
+		trial_t0 = time.time()
+		params = suggest_fn(trial)
+		factory = lambda: build_hpo_detector(model, params, args.random_state)
+		metrics = repeated_random_subsampling_metrics(
+			X_train, train_labels, hpo_args, n_repeats=args.hpo_repeats, verbose=False,
+			detector_factory=factory,
+		)
+		elapsed = time.time() - trial_t0
+		print(f"  trial {trial.number + 1}/{args.hpo_trials}: AUC={metrics['auc']:.4f}  "
+		      f"params={trial.params}  ({elapsed:.1f}s)")
+		return metrics["auc"]
+
+	t0 = time.time()
+	study.optimize(objective, n_trials=args.hpo_trials)
+	total_elapsed = time.time() - t0
+
+	print("\n" + "=" * 60)
+	print("HPO RESULT")
+	print("=" * 60)
+	print(f"Best AUC ({args.hpo_repeats} repeats/trial during search): {study.best_value:.4f}")
+	print(f"Best params: {study.best_params}")
+	print(f"Total HPO time: {total_elapsed / 60:.1f} min "
+	      f"({total_elapsed / max(1, args.hpo_trials):.1f}s/trial avg)")
+	print("=" * 60 + "\n")
+
+	final_metrics = None
+	if args.hpo_final_repeats:
+		print(f"Running final check with best params at {args.hpo_final_repeats} repeats...\n")
+		final_params = resolve_fn(study.best_params)
+		final_factory = lambda: build_hpo_detector(model, final_params, args.random_state)
+		final_metrics = repeated_random_subsampling_metrics(
+			X_train, train_labels, hpo_args, n_repeats=args.hpo_final_repeats, verbose=False,
+			detector_factory=final_factory,
+		)
+		print("=" * 60)
+		print(f"FINAL CHECK ({args.hpo_final_repeats} repeats)")
+		print("=" * 60)
+		print(f"AUC: {final_metrics['auc']:.4f} +/- {final_metrics['auc_std']:.4f}")
+		print("=" * 60 + "\n")
+
+	if getattr(args, "output_csv", None):
+		out_path = args.output_csv
+		if getattr(args, "hpo_model", None) == "all":
+			p = Path(args.output_csv)
+			out_path = str(p.with_name(f"{p.stem}_{model}{p.suffix}"))
+		Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+		study.trials_dataframe().to_csv(out_path, index=False)
+		print(f"Saved all {len(study.trials)} trials to {out_path}\n")
+
+	return study.best_value, study.best_params, final_metrics
+
+
+def run_hpo(X_train, train_labels, args):
+	if args.hpo_model == "all":
+		models = list(HPO_PARAM_SPACES)
+		print("=" * 60)
+		print(f"HPO (ALL MODELS): {', '.join(models)}")
+		print(f"({args.hpo_trials} trials x {args.hpo_repeats} repeats/trial each, "
+		      f"then {args.hpo_final_repeats}-repeat final check per model)")
+		print("=" * 60 + "\n")
+
+		summary = {}
+		t0 = time.time()
+		for model in models:
+			print("#" * 60)
+			print(f"# MODEL: {model}")
+			print("#" * 60)
+			best_value, best_params, final_metrics = run_hpo_single(model, X_train, train_labels, args)
+			summary[model] = (best_value, best_params, final_metrics)
+		total_elapsed = time.time() - t0
+
+		print("\n" + "=" * 60)
+		print(f"HPO SUMMARY (all {len(models)} models, {total_elapsed / 60:.1f} min total)")
+		print("=" * 60)
+		for model, (best_value, best_params, final_metrics) in summary.items():
+			if final_metrics is not None:
+				print(f"  {model:<18} search_AUC={best_value:.4f}  "
+				      f"final_AUC={final_metrics['auc']:.4f}+/-{final_metrics['auc_std']:.4f}")
+			else:
+				print(f"  {model:<18} search_AUC={best_value:.4f}  (no final check)")
+			print(f"    best params: {best_params}")
+		print("=" * 60 + "\n")
+		return
+
+	if args.hpo_model not in HPO_PARAM_SPACES:
+		raise ValueError(f"No HPO search space for {args.hpo_model}. Available: {list(HPO_PARAM_SPACES)}")
+	run_hpo_single(args.hpo_model, X_train, train_labels, args)
 
 
 def load_data():
@@ -203,13 +414,13 @@ class PyODAdapter(BaseEstimator):
 
 
 class DeepSVDDDetector(BaseEstimator):
-	# PyOD DeepSVDD needs n_features at init; infer from fit data so feature
-	# bagging works on column subsets. preprocessing=False — scale+PCA already
-	# applied upstream. Trained on inlier-only rows in repeated_subsampling (OCC).
-	def __init__(self, random_state=42, epochs=20, batch_size=512):
+	# PyOD DeepSVDD needs n_features at init; infer from fit data.
+	# preprocessing=False - scale+PCA already applied upstream.
+	def __init__(self, random_state=42, epochs=20, batch_size=512, hidden_neurons=None):
 		self.random_state = random_state
 		self.epochs = epochs
 		self.batch_size = batch_size
+		self.hidden_neurons = hidden_neurons if hidden_neurons is not None else [64, 32]
 		self.model_ = None
 
 	def fit(self, X, y=None):
@@ -220,7 +431,7 @@ class DeepSVDDDetector(BaseEstimator):
 			n_features=X_arr.shape[1],
 			epochs=self.epochs,
 			batch_size=self.batch_size,
-			hidden_neurons=[64, 32],
+			hidden_neurons=self.hidden_neurons,
 			preprocessing=False,
 			verbose=0,
 			random_state=self.random_state,
@@ -414,6 +625,15 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 		return DeepSVDDDetector(random_state=random_state)
 	if method == "tabpfn":
 		return TabPFNDetector(random_state=random_state)
+	if method == "lunar":
+		from pyod.models.lunar import LUNAR
+		return PyODAdapter(LUNAR(random_state=random_state))
+	if method == "ae1svm":
+		from pyod.models.ae1svm import AE1SVM
+		return PyODAdapter(AE1SVM())
+	if method == "dif":
+		from pyod.models.dif import DIF
+		return PyODAdapter(DIF(random_state=random_state))
 	raise ValueError(f"Unknown method: {method}")
 
 
@@ -452,7 +672,9 @@ def transform_scale_reduce(X, scaler, reducer):
 
 def build_pipeline(reduce, method, n_components=147, n_estimators=200,
                    random_state=42, max_subspaces=None, scale=True,
-                   feature_select=None):
+                   feature_select=None, detector_factory=None):
+	# detector_factory: optional callable returning a pre-parametrized
+	# detector, used by --hpo instead of make_detector(method, ...).
 	steps = []
 	if scale:
 		steps.append(("scale", StandardScaler()))
@@ -463,9 +685,11 @@ def build_pipeline(reduce, method, n_components=147, n_estimators=200,
 			n_estimators=min(100, n_estimators),
 		)))
 		reduce = "none"
+	detector = detector_factory() if detector_factory is not None else \
+		make_detector(method, n_estimators, random_state, max_subspaces)
 	steps.extend([
 		("reduce", make_reducer(reduce, n_components, random_state)),
-		("detector", make_detector(method, n_estimators, random_state, max_subspaces)),
+		("detector", detector),
 	])
 	return Pipeline(steps)
 
@@ -754,11 +978,14 @@ def _repeated_split_indices(y, inlier_idx_all, outlier_idx_all, seed, inlier_fra
 
 
 def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=25,
-                                         inlier_frac=0.8, outlier_frac=0.8, verbose=True):
+                                         inlier_frac=0.8, outlier_frac=0.8, verbose=True,
+                                         detector_factory=None):
 	# Step A. Folie 7 (Week 3): sample 80% of inliers for training; combine
 	# the remaining 20% inliers with a random 80% sample of outliers as the
 	# validation split; repeat many times. Training uses ONLY inliers, no
 	# labels passed into fit anywhere - pure OCC framing as on that slide.
+	#
+	# detector_factory: used by --hpo to inject a trial's hyperparameters.
 	if getattr(args, "feature_select", None) or getattr(args, "smote", False):
 		raise ValueError(
 			"repeated_subsampling doesn't support --feature-select/--smote "
@@ -790,6 +1017,7 @@ def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=2
 			max_subspaces=args.max_subspaces,
 			scale=args.scale,
 			feature_select=None,
+			detector_factory=detector_factory,
 		)
 		pipeline.fit(X_tr)  # inlier-only fit, no labels passed anywhere
 		scores_val = anomaly_scores(pipeline, X_val)
@@ -825,10 +1053,15 @@ def repeated_random_subsampling_metrics(X_train, train_labels, args, n_repeats=2
 
 def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repeats=25,
                                       n_subsets=10, subset_min_frac=0.5,
-                                      inlier_frac=0.8, outlier_frac=0.8, verbose=True):
+                                      inlier_frac=0.8, outlier_frac=0.8, verbose=True,
+                                      detector_params=None):
 	# Step B, full repeated-subsampling version. Same 80/20 split logic as
 	# Step A; scale+reduce fit on the train split only, applied to val with
 	# the same fit (no leakage).
+	#
+	# detector_params: optional dict of tuned hyperparameters (from --hpo),
+	# used via build_hpo_detector instead of make_detector's defaults - for
+	# both the no_bagging baseline and every subset detector.
 	#
 	# Week 5, Step 2: two new aggregation variants alongside sum/max/aom:
 	#   - pruned: drop the subsets least correlated with the ensemble
@@ -876,7 +1109,10 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 
 		# baseline: no bagging, single model on all components, trained on
 		# this repeat's train split, scored on this repeat's val split
-		base_detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
+		if detector_params is not None:
+			base_detector = build_hpo_detector(method, detector_params, args.random_state)
+		else:
+			base_detector = make_detector(method, args.n_estimators, args.random_state, args.max_subspaces)
 		base_detector.fit(X_tr_red)
 		base_scores_val = -base_detector.score_samples(X_val_red)
 		repeat_results["no_bagging"].append(roc_auc_score(y_val, base_scores_val))
@@ -919,7 +1155,9 @@ def feature_bagging_repeated_metrics(X_train, train_labels, args, method, n_repe
 				k = int(rng_subsets.integers(int(subset_min_frac * d), d + 1))
 				cols = rng_subsets.choice(d, size=k, replace=False)
 
-			detector = make_detector(method, args.n_estimators, args.random_state + j + 1, args.max_subspaces)
+			detector = build_hpo_detector(method, detector_params, args.random_state + j + 1) \
+				if detector_params is not None else \
+				make_detector(method, args.n_estimators, args.random_state + j + 1, args.max_subspaces)
 			detector.fit(X_tr_red[:, cols])
 			scores_val = -detector.score_samples(X_val_red[:, cols])
 
@@ -994,9 +1232,23 @@ def feature_bagging_comparison(X_train, train_labels, args):
 	else:
 		methods = FEATURE_BAGGING_METHODS
 
+	json_override = getattr(args, "detector_params_json", None)
+	use_tuned = getattr(args, "tuned", False)
+	if json_override:
+		import json as _json
+		override_params = _json.loads(json_override)
+	elif use_tuned:
+		missing = [m for m in methods if m not in TUNED_PARAMS]
+		if missing:
+			raise ValueError(f"--tuned has no TUNED_PARAMS entry for: {missing}")
+		override_params = None  # resolved per-method from TUNED_PARAMS below
+	else:
+		override_params = None
+
 	total_fits = args.n_repeats * args.n_subsets * len(methods)
 	print("="*60)
-	print(f"FEATURE BAGGING (repeated subsampling): {', '.join(methods)}")
+	print(f"FEATURE BAGGING (repeated subsampling): {', '.join(methods)}" +
+	      (" (tuned params)" if (use_tuned or json_override) else ""))
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
 	      f"n_repeats={args.n_repeats}, n_subsets={args.n_subsets})")
 	print(f"Total fits: {args.n_repeats} repeats x {args.n_subsets} subsets x "
@@ -1008,9 +1260,16 @@ def feature_bagging_comparison(X_train, train_labels, args):
 		print("#" * 60)
 		print(f"# METHOD: {method}")
 		print("#" * 60)
+		if json_override:
+			params_for_method = override_params
+		elif use_tuned:
+			params_for_method = TUNED_PARAMS[method]
+		else:
+			params_for_method = None
 		rows[method] = feature_bagging_repeated_metrics(
 			X_train, train_labels, args, method,
 			n_repeats=args.n_repeats, n_subsets=args.n_subsets, verbose=False,
+			detector_params=params_for_method,
 		)
 		for key, stats_ in rows[method].items():
 			print(f"  {key:<15} {stats_['mean']:.4f} +/- {stats_['std']:.4f}  ({stats_['n']} repeats)")
@@ -1275,6 +1534,58 @@ def run_pipeline(X_train, X_test, train_labels, test_ids, args, save=True):
 	return eval_metrics
 
 
+def compare_reductions(X_train, train_labels, args):
+	# Fixes --method/--n-components, varies --reduce across --reduce-sweep's
+	# comma-separated list - same repeated_random_subsampling_metrics
+	# machinery and output shape as compare_methods, just a different axis.
+	reduces = [r.strip() for r in args.reduce_sweep.split(",") if r.strip()]
+
+	print("=" * 60)
+	print(f"COMPARING REDUCTIONS: {', '.join(reduces)}")
+	print(f"(method={args.method}, n_components={args.n_components}, scale={args.scale}, "
+	      f"n_repeats={args.n_repeats})")
+	print("=" * 60 + "\n")
+
+	results = {}
+	for r in reduces:
+		print("#" * 60)
+		print(f"# REDUCE: {r}")
+		print("#" * 60)
+
+		method_args = argparse.Namespace(**{**vars(args), "reduce": r,
+		                                     "feature_select": None, "smote": False})
+		metrics = repeated_random_subsampling_metrics(
+			X_train, train_labels, method_args, n_repeats=args.n_repeats, verbose=False,
+		)
+		results[r] = metrics["repeat_aucs"]
+		print(f"AUC: {metrics['auc']:.4f} +/- {metrics['auc_std']:.4f}  "
+		      f"({metrics['n_repeats']} valid repeats)\n")
+
+	min_len = min(len(v) for v in results.values())
+	if any(len(v) != min_len for v in results.values()):
+		print(f"WARNING: reductions had different numbers of valid repeats, "
+		      f"truncating all to {min_len} for the matrix.\n")
+
+	matrix = pd.DataFrame({r: v[:min_len] for r, v in results.items()})
+	matrix.index.name = "repeat"
+
+	print("=" * 60)
+	print(f"AUC MATRIX ({matrix.shape[0]} repeats x {matrix.shape[1]} reductions)")
+	print("run --stat-test on the saved CSV for the Friedman/Conover-Iman test")
+	print("=" * 60)
+	print(matrix.round(4).to_string())
+	print()
+	print("Mean +/- Std per reduction:")
+	print((matrix.mean().round(4).astype(str) + " +/- " + matrix.std(ddof=1).round(4).astype(str)).to_string())
+	print("=" * 60 + "\n")
+
+	if getattr(args, "output_csv", None):
+		Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+		matrix.to_csv(args.output_csv)
+		print(f"Saved AUC matrix to {args.output_csv} "
+		      f"({matrix.shape[0]} rows x {matrix.shape[1]} columns)\n")
+
+
 def compare_methods(X_train, train_labels, args):
 	# Runs a method list through repeated_random_subsampling_metrics with
 	# identical reduce/n_components/scale settings (fair comparison, same
@@ -1294,11 +1605,21 @@ def compare_methods(X_train, train_labels, args):
 		methods = COMPARE_METHODS
 	elif raw_methods_set == "week5":
 		methods = COMPARE_METHODS_WEEK5
+	elif raw_methods_set == "week6_neural_graph":
+		methods = COMPARE_METHODS_WEEK6_NEURAL_GRAPH
+	elif raw_methods_set == "week6_final":
+		methods = COMPARE_METHODS_WEEK6_FINAL
 	else:
 		methods = [m.strip() for m in raw_methods_set.split(",") if m.strip()]
 
+	use_tuned = getattr(args, "tuned", False)
+	if use_tuned:
+		missing = [m for m in methods if m not in TUNED_PARAMS]
+		if missing:
+			raise ValueError(f"--tuned has no TUNED_PARAMS entry for: {missing}")
+
 	print("="*60)
-	print(f"COMPARING METHODS: {', '.join(methods)}")
+	print(f"COMPARING METHODS: {', '.join(methods)}" + (" (tuned params)" if use_tuned else ""))
 	print(f"(reduce={args.reduce}, n_components={args.n_components}, scale={args.scale}, "
 	      f"n_repeats={args.n_repeats})")
 	print("="*60 + "\n")
@@ -1311,8 +1632,12 @@ def compare_methods(X_train, train_labels, args):
 
 		method_args = argparse.Namespace(**{**vars(args), "method": method,
 		                                     "feature_select": None, "smote": False})
+		detector_factory = None
+		if use_tuned:
+			detector_factory = lambda m=method: build_hpo_detector(m, TUNED_PARAMS[m], args.random_state)
 		metrics = repeated_random_subsampling_metrics(
 			X_train, train_labels, method_args, n_repeats=args.n_repeats, verbose=False,
+			detector_factory=detector_factory,
 		)
 		results[method] = metrics["repeat_aucs"]
 		print(f"AUC: {metrics['auc']:.4f} +/- {metrics['auc_std']:.4f}  "
@@ -1450,11 +1775,29 @@ def main():
 	                          f"Overrides --method and --eval-strategy. See --methods-set to "
 	                          f"compare a different method list instead.")
 	parser.add_argument("--methods-set", type=str, default=None,
-	                     help="Week 5: which method list --compare-methods should use. "
-	                          "'week5' = COMPARE_METHODS_WEEK5 (last week's 6 methods + "
-	                          "tabpfn). Otherwise pass a comma-separated list of --method "
-	                          "names, e.g. 'isolation_forest,tabpfn'. Default: original "
-	                          "6-method COMPARE_METHODS (Week 4 behavior, unchanged).")
+	                     help="'week5' = COMPARE_METHODS_WEEK5. "
+	                          "'week6_neural_graph' = COMPARE_METHODS_WEEK6_NEURAL_GRAPH. "
+	                          "'week6_final' = COMPARE_METHODS_WEEK6_FINAL (isolation_forest, "
+	                          "knn, deep_svdd, lunar, dif). Otherwise comma-separated --method "
+	                          "names. Default: original COMPARE_METHODS.")
+	parser.add_argument("--tuned", action="store_true",
+	                     help="With --compare-methods or --feature-bagging: use TUNED_PARAMS "
+	                          "(best params from --hpo) instead of each method's defaults. "
+	                          "Requires every method in the resolved list to have a "
+	                          "TUNED_PARAMS entry. Ignored if --detector-params-json is set.")
+	parser.add_argument("--detector-params-json", type=str, default=None,
+	                     help="With --feature-bagging: JSON dict of hyperparameters to use "
+	                          "for the (single) method instead of defaults or TUNED_PARAMS, "
+	                          "e.g. '{\"n_estimators\": 84, \"max_samples\": 0.1, "
+	                          "\"max_features\": 0.36}'. Takes precedence over --tuned - use "
+	                          "this when the tuned params depend on --reduce (e.g. different "
+	                          "HPO results for pca vs truncated_svd) rather than just the "
+	                          "method.")
+	parser.add_argument("--reduce-sweep", type=str, default=None,
+	                     help="Comma-separated --reduce techniques to compare for the SAME "
+	                          "--method/--n-components, e.g. "
+	                          "'none,pca,random_projection,truncated_svd,isomap,umap'. "
+	                          "Overrides --compare-methods/--method's --reduce.")
 	parser.add_argument("--output-csv", type=str, default=None,
 	                     help="Save repeats x configurations AUC matrix to this CSV path. With "
 	                          "--stat-test: saves the resulting ++/+/- significance table instead.")
@@ -1495,6 +1838,34 @@ def main():
 	                          f"sum/max/rank_avg/pruned/damped each repeat (same 5-variant "
 	                          f"recipe as --feature-bagging, over methods instead of feature "
 	                          f"subsets). Overrides --method/--compare-methods/--feature-bagging.")
+	parser.add_argument("--hpo", action="store_true",
+	                     help=f"Week 6, Step 2: Optuna hyperparameter search for --hpo-model, "
+	                          f"using --hpo-repeats repeated_subsampling for each trial "
+	                          f"(cheaper than the 25-repeat default - search AUC is noisier "
+	                          f"but comparable across trials), then one --hpo-final-repeats "
+	                          f"run with the best found params. Available models: "
+	                          f"{list(HPO_PARAM_SPACES)}. Overrides --method/--compare-methods/"
+	                          f"--feature-bagging/--heterogeneous-ensemble.")
+	parser.add_argument("--hpo-model", type=str, default=None,
+	                     choices=list(HPO_PARAM_SPACES) + ["all"],
+	                     help="Which model --hpo tunes. 'all' runs every model in "
+	                          "HPO_PARAM_SPACES sequentially in one invocation, printing a "
+	                          "combined summary at the end.")
+	parser.add_argument("--hpo-trials", type=int, default=50,
+	                     help="Number of Optuna trials for --hpo")
+	parser.add_argument("--hpo-repeats", type=int, default=5,
+	                     help="repeated_subsampling repeats PER TRIAL during --hpo search "
+	                          "(kept low - cost is trials x this - full 25-repeat precision "
+	                          "isn't needed just to rank candidates)")
+	parser.add_argument("--hpo-final-repeats", type=int, default=25,
+	                     help="repeated_subsampling repeats for the one-off final check of "
+	                          "--hpo's best params (0 to skip)")
+	parser.add_argument("--hpo-sampler", type=str, default="gp", choices=["gp", "tpe"],
+	                     help="Optuna sampler for --hpo. 'gp' = Gaussian Process surrogate + "
+	                          "Expected Improvement (precise for our small, mostly-continuous "
+	                          "search spaces, chat decision). 'tpe' = Optuna's default "
+	                          "Tree-structured Parzen Estimator (scales better to many/"
+	                          "categorical dims, not needed here).")
 	parser.add_argument("--stat-test", type=str, default=None,
 	                     help="Week 4: path to a repeats x configurations AUC matrix CSV. "
 	                          "Runs a Friedman test, then (if significant) Conover-Iman "
@@ -1555,6 +1926,13 @@ def main():
 		print(f"Subsampled train_set to {len(X_train):,} rows for quick testing "
 		      f"(active: {n_active} - metrics below are NOT meaningful, runtime check only)\n")
 
+	if args.hpo:
+		if not args.hpo_model:
+			raise ValueError("--hpo requires --hpo-model (choices: "
+			                  f"{list(HPO_PARAM_SPACES)})")
+		run_hpo(X_train, train_labels, args)
+		return
+
 	if args.heterogeneous_ensemble:
 		heterogeneous_ensemble_comparison(X_train, train_labels, args)
 		return
@@ -1565,6 +1943,10 @@ def main():
 
 	if args.compare_methods:
 		compare_methods(X_train, train_labels, args)
+		return
+
+	if args.reduce_sweep:
+		compare_reductions(X_train, train_labels, args)
 		return
 
 	if args.sweep:

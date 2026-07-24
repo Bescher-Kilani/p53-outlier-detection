@@ -9,3 +9,4 @@ torch
 scikit-posthocs
 tabpfn
 tabpfn-extensions
+optuna

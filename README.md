@@ -59,6 +59,11 @@ https://huggingface.co/Prior-Labs/tabpfn_3 and run `hf auth login` (or set
 `pip install --no-build-isolation "git+https://github.com/josipd/torch-two-sample.git"`
 (same numpy-not-visible-during-build issue as the `gmd` workaround below).
 
+**Week 6 additions:** hyperparameter search (`--hpo`) needs `optuna`
+(added to `requirements.txt`); its `GPSampler` is still marked
+experimental upstream (works fine here, just prints an
+`ExperimentalWarning` on every run).
+
 ## Reproducing the pipeline
 
 1. Place `train_data.data` and `train_gt.csv` (from ILIAS) in this folder.
@@ -139,7 +144,7 @@ Not required to reproduce the pipeline above.
   train fold only (uses labels on train split). UMAP CV uses k=200 only.
 
   | Reduction                | AUC (full train) | AUC (3-fold stratified CV) | AUC (CV + norm)   | AUC (CV + norm + SMOTE) |
-  |--------------------------|------------------|----------------------------|-------------------|-------------------------|
+  |--------------------------|------------------|----------------------------|--------------------|-------------------------|
   | PCA                      | 0.6733           | 0.6734 +/- 0.0411          | 0.7291 +/- 0.0543 | 0.5200 +/- 0.0673       |
   | TruncatedSVD             | 0.6657           | 0.6733 +/- 0.0333          | 0.7285 +/- 0.0504 | 0.5076 +/- 0.0624       |
   | none (raw)               | 0.5902           | 0.5926 +/- 0.0624          | 0.5926 +/- 0.0624 | 0.4256 +/- 0.0706       |
@@ -158,7 +163,7 @@ Not required to reproduce the pipeline above.
   on selected subset; mRMR/IFS use labels on train only):
 
   | Method                   | AUC (full train) | AUC (3-fold stratified CV) | AUC (CV + norm)   | AUC (CV + norm + SMOTE) |
-  |--------------------------|------------------|----------------------------|-------------------|-------------------------|
+  |--------------------------|------------------|----------------------------|--------------------|-------------------------|
   | mRMR + IFS (max 147)     | 0.8181 (575s)    | 0.7511 +/- 0.0466 (1024s)  | 0.7499 +/- 0.0576 (1015s) | 0.3474 +/- 0.0746 (2261s) |
 
   mRMR ranks features (MI relevance − correlation redundancy); IFS picks
@@ -759,3 +764,183 @@ from Week 4:
 python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 147 \
     --feature-bagging --n-repeats 25 --n-subsets 10
 ```
+
+## Week 6 — key findings
+
+Course topic: Novel Techniques in OD for Large Databases. Structure this
+week: (1) hyperparameter optimization (HPO) via Optuna for isolation_forest,
+knn, deep_svdd, lunar, and dif, (2) a follow-up on n_components=200 for
+PCA, including whether other reduction techniques beat PCA there, and
+whether HPO improves Isolation Forest specifically at 200 dims.
+
+### Step 1 — HPO for 5 models (Optuna, GP sampler, 150 trials × 15 repeats/trial, PCA-147)
+
+HPO run for isolation_forest, knn, deep_svdd, lunar, and dif (search space:
+3–4 hyperparameters per model, see `HPO_PARAM_SPACES` in
+`p53_od_pipeline.py`). DIF's search was too slow to finish within budget
+(~5 min/trial) — its best trial found so far
+(`representation_dim=45, n_ensemble=75, n_estimators=10`) was used as its
+"tuned" configuration.
+
+**Default params:**
+
+| | AUC |
+|---|-----|
+| Isolation Forest | **0.7248 ± 0.0227** |
+| DIF | 0.7056 ± 0.0223 |
+| KNN | 0.6997 ± 0.0205 |
+| Deep SVDD | 0.6981 ± 0.0351 |
+| LUNAR | 0.6736 ± 0.0210 |
+
+**Tuned params (`--hpo`):**
+
+| | AUC |
+|---|-----|
+| Isolation Forest | **0.7239 ± 0.0209** |
+| DIF | 0.7087 ± 0.0228 |
+| KNN | 0.7048 ± 0.0199 |
+| Deep SVDD | 0.6981 ± 0.0351 |
+| LUNAR | 0.6849 ± 0.0211 |
+
+HPO gave a small, consistent gain for KNN/LUNAR/DIF (+0.3 to +1.1 pp),
+essentially no change for Deep SVDD (tuning round-tripped back to the
+same `[64,32]` architecture already used since Week 4) and no gain for
+Isolation Forest (0.7248 → 0.7239, within noise). The ranking is
+unchanged either way — Isolation Forest stays the best single method by
+a clear margin.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --hpo --hpo-model isolation_forest --reduce pca --n-components 147 \
+    --hpo-trials 150 --hpo-repeats 15 --hpo-final-repeats 25 --output-csv outputs/hpo_isolation_forest.csv
+# repeat for --hpo-model knn / deep_svdd / lunar, or --hpo-model all to run every model in one invocation
+
+python p53_od_pipeline.py --compare-methods --methods-set week6_final --reduce pca --n-components 147 --n-repeats 25 \
+    --output-csv outputs/week6_final_default_auc_matrix.csv
+python p53_od_pipeline.py --compare-methods --methods-set week6_final --tuned --reduce pca --n-components 147 --n-repeats 25 \
+    --output-csv outputs/week6_final_tuned_auc_matrix.csv
+```
+
+### Step 2 — reduction method sweep (Isolation Forest, 200 dims, 25 repeats)
+
+Testing n_components=200 for the first time found a clear improvement
+over the n=147 used throughout (AUC 0.7393 ± 0.0233 vs. 0.7248 ± 0.0227).
+This step checks whether another reduction technique does even better at
+the same target dimensionality.
+
+| | AUC |
+|---|-----|
+| PCA | **0.7393 ± 0.0233** |
+| Truncated SVD | 0.7391 ± 0.0213 |
+| Random Projection | 0.6828 ± 0.0215 |
+| UMAP | 0.5619 ± 0.0505 |
+
+PCA and Truncated SVD are statistically indistinguishable here (expected —
+Truncated SVD is PCA without centering). Random Projection and UMAP both
+underperform PCA/SVD by a wide margin.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --method isolation_forest --reduce-sweep pca,random_projection,truncated_svd,umap \
+    --n-components 200 --n-repeats 25 --output-csv outputs/week6_reduce_sweep_auc_matrix.csv
+```
+
+### Step 3 — feature bagging, Isolation Forest at 200 dims (default params, 25 repeats, 10 subsets)
+
+| | AUC |
+|---|-----|
+| No bagging | 0.7392 ± 0.0233 |
+| Sum | 0.7429 ± 0.0198 |
+| Max | 0.7409 ± 0.0201 |
+| AOM | 0.7427 ± 0.0196 |
+| Pruned | **0.7438 ± 0.0199** |
+| Damped | 0.7429 ± 0.0198 |
+
+Same small, consistent bagging gain (+0.5 to +0.9 pp) as the Week 5
+147-dim result — the effect scales cleanly to 200 dims. `pruned` is the
+new best aggregation variant, and **0.7438 is the best result of the
+whole project so far.**
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 200 --n-repeats 25 \
+    --output-csv outputs/week6_feature_bagging_if_pca200.csv
+```
+
+### Step 4 — feature bagging, Isolation Forest at 200 dims, with HPO-tuned params
+
+Separate HPO runs (150 trials × 15 repeats each) for Isolation Forest
+specifically at 200 dims, run once for PCA and once for Truncated SVD —
+since best-by-year hyperparameters can differ per reduction technique
+(different feature scale/structure per method), not just per detector.
+
+**PCA-200, tuned (`n_estimators=500, max_samples=0.1, max_features=0.831`):**
+
+| | AUC |
+|---|-----|
+| No bagging | 0.7372 ± 0.0218 |
+| Sum | 0.7369 ± 0.0203 |
+| Max | 0.7372 ± 0.0200 |
+| AOM | 0.7368 ± 0.0204 |
+| Pruned | **0.7375 ± 0.0207** |
+| Damped | 0.7369 ± 0.0203 |
+
+**Truncated SVD-200, tuned (`n_estimators=84, max_samples=0.1, max_features=0.363`):**
+
+| | AUC |
+|---|-----|
+| No bagging | 0.7323 ± 0.0227 |
+| Sum | 0.7345 ± 0.0203 |
+| Max | 0.7344 ± 0.0213 |
+| AOM | **0.7349 ± 0.0204** |
+| Pruned | 0.7337 ± 0.0211 |
+| Damped | 0.7346 ± 0.0203 |
+
+**Negative result:** neither tuned configuration beats Step 3's
+default-params result (0.7438), and the SVD-200 no_bagging baseline
+(0.7323) is actually below the equivalent default-params run from Step 2
+(0.7391). All configurations here sit within roughly one standard
+deviation of each other — the 200-dim Isolation Forest HPO search (15
+repeats/trial) most likely landed on evaluation noise rather than a
+genuine improvement over well-chosen defaults. Unlike KNN/LUNAR/DIF in
+Step 1, HPO did not help Isolation Forest at either dimensionality tested
+this week.
+
+Reproduce:
+```bash
+python p53_od_pipeline.py --feature-bagging --bagging-methods isolation_forest --reduce pca --n-components 200 \
+    --n-repeats 25 --detector-params-json '{"n_estimators": 500, "max_samples": 0.1, "max_features": 0.8312426187498287}' \
+    --output-csv outputs/week6_feature_bagging_if_pca200_tuned.csv
+python p53_od_pipeline.py --feature-bagging --bagging-methods isolation_forest --reduce truncated_svd --n-components 200 \
+    --n-repeats 25 --detector-params-json '{"n_estimators": 84, "max_samples": 0.1, "max_features": 0.36321980494541484}' \
+    --output-csv outputs/week6_feature_bagging_if_svd200_tuned.csv
+```
+
+### Week 6 best (OCC deliverable)
+
+n_components=200 (Step 2) turned out to matter more than HPO (Steps 1
+and 4) — dimensionality choice beat hyperparameter tuning as the more
+effective lever this week, for Isolation Forest specifically.
+
+| Rank | Configuration | AUC | Why |
+|------|---------------|-----|-----|
+| **1 (use this)** | **Isolation Forest + PCA (200) + StandardScaler + feature bagging (Pruned, default IF params, random subspaces)** | **0.7438 ± 0.0199** | Best result of the project so far; simple, no HPO needed |
+| 2 | Isolation Forest + PCA (200) + scale (no bagging) | 0.7392 ± 0.0233 | Confirms n=200 > n=147 (0.7248) independent of bagging |
+| 3 | Isolation Forest + Truncated SVD (200) + feature bagging (AOM, tuned params) | 0.7349 ± 0.0204 | Truncated SVD ties PCA on raw AUC (Step 2) but tuning + bagging together still land below PCA's untuned result |
+| — | Isolation Forest + PCA (200), HPO-tuned (no bagging) | 0.7372 ± 0.0218 | HPO gave no measurable gain over defaults at this dimensionality |
+| — | DIF / KNN / LUNAR / Deep SVDD (147 dims, tuned) | 0.6849–0.7087 | All below Isolation Forest; DIF and KNN benefited most from HPO among the non-IF models |
+
+**Pipeline command for the Week 6 winner:**
+
+```bash
+python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 200 \
+    --feature-bagging --n-repeats 25 --n-subsets 10
+```
+
+Use **pruned** aggregation when reading Step 3 output
+(`isolation_forest_pruned` column in
+`outputs/week6_feature_bagging_if_pca200.csv`). Labels are for evaluation
+only — never passed into `.fit()`.
+
+----------------------------------------------------
+OMAR,IF YOU SEE THIS; YOU CAN TRY OUT OVERSAMPLING OR ANOTHER IDEAS
