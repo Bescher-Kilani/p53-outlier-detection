@@ -9,4 +9,5 @@ __pycache__/
 *.csv
 .~lock.*#
 *.parquet
-*.pdf!week6-tables/*.csv
+*.pdf
+!week6-tables/*.csv
