@@ -122,11 +122,18 @@ COMPARE_METHODS_WEEK6_FINAL = ["isolation_forest", "knn", "deep_svdd", "lunar", 
 # search still running at representation_dim=45/n_ensemble=75/n_estimators=10,
 # AUC=0.7166). Used by --compare-methods --tuned via build_hpo_detector.
 TUNED_PARAMS = {
-	"isolation_forest": {"n_estimators": 148, "max_samples": 1.0, "max_features": 1.0},
+	"isolation_forest": {
+		"n_estimators": 143,
+		"max_samples": 0.21404896259450956,
+		"max_features": 0.9381550605728436,
+		"bootstrap": True,
+	},
 	"knn": {"n_neighbors": 50, "method": "largest"},
 	"deep_svdd": {"hidden_neurons": [64, 32], "epochs": 40, "batch_size": 128},
 	"lunar": {"n_neighbours": 9, "n_epochs": 110, "lr": 0.0002912245673897},
 	"dif": {"representation_dim": 45, "n_ensemble": 75, "n_estimators": 10},
+	"inne": {"n_estimators": 320, "max_samples": 11},
+	"loda": {"n_bins": 46, "n_random_cuts": 234},
 }
 
 # Week 6, Step 2: HPO via Optuna for isolation_forest, knn, deep_svdd,
@@ -141,6 +148,7 @@ def _suggest_params_isolation_forest(trial):
 		"n_estimators": trial.suggest_int("n_estimators", 50, 500),
 		"max_samples": trial.suggest_float("max_samples", 0.1, 1.0),
 		"max_features": trial.suggest_float("max_features", 0.3, 1.0),
+		"bootstrap": trial.suggest_categorical("bootstrap", [True, False]),
 	}
 
 
@@ -184,6 +192,22 @@ def _suggest_params_lunar(trial):
 	}
 
 
+def _suggest_params_inne(trial):
+	# PyOD INNE: max_samples='auto' means min(8, n). Float fractions of n
+	# (~20k) make distance computations infeasible — keep small ints.
+	return {
+		"n_estimators": trial.suggest_int("n_estimators", 50, 400),
+		"max_samples": trial.suggest_int("max_samples", 8, 64),
+	}
+
+
+def _suggest_params_loda(trial):
+	return {
+		"n_bins": trial.suggest_int("n_bins", 5, 50),
+		"n_random_cuts": trial.suggest_int("n_random_cuts", 50, 500),
+	}
+
+
 def _identity(raw):
 	return dict(raw)
 
@@ -194,6 +218,8 @@ HPO_PARAM_SPACES = {
 	"deep_svdd": (_suggest_params_deep_svdd, _resolve_params_deep_svdd),
 	"dif": (_suggest_params_dif, _identity),
 	"lunar": (_suggest_params_lunar, _identity),
+	"inne": (_suggest_params_inne, _identity),
+	"loda": (_suggest_params_loda, _identity),
 }
 
 
@@ -211,6 +237,12 @@ def build_hpo_detector(model, params, random_state):
 	if model == "lunar":
 		from pyod.models.lunar import LUNAR
 		return PyODAdapter(LUNAR(random_state=random_state, **params))
+	if model == "inne":
+		from pyod.models.inne import INNE
+		return PyODAdapter(INNE(random_state=random_state, contamination=0.05, **params))
+	if model == "loda":
+		from pyod.models.loda import LODA
+		return PyODAdapter(LODA(contamination=0.05, **params))
 	raise ValueError(f"No HPO search space for {model}. Available: {list(HPO_PARAM_SPACES)}")
 
 
@@ -634,6 +666,12 @@ def make_detector(method, n_estimators, random_state, max_subspaces):
 	if method == "dif":
 		from pyod.models.dif import DIF
 		return PyODAdapter(DIF(random_state=random_state))
+	if method == "inne":
+		from pyod.models.inne import INNE
+		return PyODAdapter(INNE(n_estimators=n_estimators, random_state=random_state, contamination=0.05))
+	if method == "loda":
+		from pyod.models.loda import LODA
+		return PyODAdapter(LODA(n_bins=10, n_random_cuts=100, contamination=0.05))
 	raise ValueError(f"Unknown method: {method}")
 
 
@@ -764,6 +802,8 @@ _DETECTOR_LABELS = {
 	"ocsvm": "FITTING ONE-CLASS SVM (sklearn, rbf kernel)",
 	"abod": "FITTING FAST-ABOD (PyOD, n_neighbors=10)",
 	"deep_svdd": "FITTING DEEP SVDD (PyOD, MLP [64,32], epochs=20, inlier-only OCC)",
+	"inne": "FITTING INNE (PyOD Isolation Nearest-Neighbor Ensemble)",
+	"loda": "FITTING LODA (PyOD Lightweight On-line Detector of Anomalies)",
 }
 
 
@@ -1540,11 +1580,27 @@ def compare_reductions(X_train, train_labels, args):
 	# machinery and output shape as compare_methods, just a different axis.
 	reduces = [r.strip() for r in args.reduce_sweep.split(",") if r.strip()]
 
+	json_override = None
+	if getattr(args, "detector_params_json", None):
+		import json as _json
+		json_override = _json.loads(args.detector_params_json)
+	use_tuned = getattr(args, "tuned", False) and json_override is None
+	if use_tuned and args.method not in TUNED_PARAMS:
+		raise ValueError(f"--tuned has no TUNED_PARAMS entry for: {args.method}")
+
 	print("=" * 60)
 	print(f"COMPARING REDUCTIONS: {', '.join(reduces)}")
 	print(f"(method={args.method}, n_components={args.n_components}, scale={args.scale}, "
-	      f"n_repeats={args.n_repeats})")
+	      f"n_repeats={args.n_repeats}"
+	      + (" , tuned params)" if (use_tuned or json_override) else ")"))
 	print("=" * 60 + "\n")
+
+	if json_override is not None:
+		detector_factory = lambda: build_hpo_detector(args.method, json_override, args.random_state)
+	elif use_tuned:
+		detector_factory = lambda: build_hpo_detector(args.method, TUNED_PARAMS[args.method], args.random_state)
+	else:
+		detector_factory = None
 
 	results = {}
 	for r in reduces:
@@ -1556,6 +1612,7 @@ def compare_reductions(X_train, train_labels, args):
 		                                     "feature_select": None, "smote": False})
 		metrics = repeated_random_subsampling_metrics(
 			X_train, train_labels, method_args, n_repeats=args.n_repeats, verbose=False,
+			detector_factory=detector_factory,
 		)
 		results[r] = metrics["repeat_aucs"]
 		print(f"AUC: {metrics['auc']:.4f} +/- {metrics['auc_std']:.4f}  "

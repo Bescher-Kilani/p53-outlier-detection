@@ -1,4 +1,4 @@
-# p53 Mutants — Outlier Detection
+﻿# p53 Mutants — Outlier Detection
 
 ## Problem Statement
 
@@ -767,58 +767,89 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 
 ## Week 6 — key findings
 
-Course topic: Novel Techniques in OD for Large Databases. Structure this
-week: (1) hyperparameter optimization (HPO) via Optuna for isolation_forest,
-knn, deep_svdd, lunar, and dif, (2) a follow-up on n_components=200 for
-PCA, including whether other reduction techniques beat PCA there, and
-whether HPO improves Isolation Forest specifically at 200 dims.
+Course topic: Novel Techniques in OD for Large Databases.
 
-### Step 1 — HPO for 5 models (Optuna, GP sampler, 150 trials × 15 repeats/trial, PCA-147)
+**This week’s arc**
 
-HPO run for isolation_forest, knn, deep_svdd, lunar, and dif (search space:
-3–4 hyperparameters per model, see `HPO_PARAM_SPACES` in
+1. **Step 1** — HPO (Optuna) for OCC detectors at PCA-147, including INNE/LODA
+2. **Step 2** — push dimensionality to n=200 (IF reduce sweep + tuned INNE transfer)
+3. **Step 3** — feature bagging at PCA-200 (IF defaults + tuned INNE)
+4. **Step 4** — does IF HPO at 200 dims beat Step 3 defaults? (no)
+5. **Held-out test** — full-train fit → internal test AUC (end of README)
+
+Plots (README mean±std → seaborn boxplots): `plot_week6_step1_boxplots.py`,
+`plot_week6_step3_boxplots.py` → PNGs under `week6-tables/`.
+
+### Step 1 — HPO for OCC models (Optuna, PCA-147)
+
+HPO run for isolation_forest, knn, deep_svdd, lunar, and dif (GP sampler,
+150 trials × 15 repeats/trial; see `HPO_PARAM_SPACES` in
 `p53_od_pipeline.py`). DIF's search was too slow to finish within budget
 (~5 min/trial) — its best trial found so far
 (`representation_dim=45, n_ensemble=75, n_estimators=10`) was used as its
 "tuned" configuration.
+
+**INNE / LODA (added later):** same OCC protocol (scale + PCA-147, inlier-only
+fit, 15 repeats/trial, 25-repeat final check), TPE sampler, 50 trials each.
+INNE's search keeps `max_samples` as a small integer (8–64): PyOD's
+`max_samples="auto"` is `min(8, n)`, and float fractions of ~20k rows make
+INNE's distance computations infeasible.
 
 **Default params:**
 
 | | AUC |
 |---|-----|
 | Isolation Forest | **0.7248 ± 0.0227** |
+| INNE | 0.7231 ± 0.0204 |
 | DIF | 0.7056 ± 0.0223 |
 | KNN | 0.6997 ± 0.0205 |
 | Deep SVDD | 0.6981 ± 0.0351 |
 | LUNAR | 0.6736 ± 0.0210 |
+| LODA | 0.6012 ± 0.0763 |
 
 **Tuned params (`--hpo`):**
 
-| | AUC |
-|---|-----|
-| Isolation Forest | **0.7239 ± 0.0209** |
-| DIF | 0.7087 ± 0.0228 |
-| KNN | 0.7048 ± 0.0199 |
-| Deep SVDD | 0.6981 ± 0.0351 |
-| LUNAR | 0.6849 ± 0.0211 |
+| | AUC | Best params |
+|---|-----|-------------|
+| Isolation Forest | **0.7277 ± 0.0223** | `n_estimators=143, max_samples≈0.214, max_features≈0.938, bootstrap=True` |
+| INNE | 0.7289 ± 0.0214 | `n_estimators=320, max_samples=11` |
+| DIF | 0.7087 ± 0.0228 | `representation_dim=45, n_ensemble=75, n_estimators=10` |
+| LODA | 0.7120 ± 0.0194 | `n_bins=46, n_random_cuts=234` |
+| KNN | 0.7048 ± 0.0199 | `n_neighbors=50, method=largest` |
+| Deep SVDD | 0.6981 ± 0.0351 | `hidden_neurons=[64,32], epochs=40, batch_size=128` |
+| LUNAR | 0.6849 ± 0.0211 | `n_neighbours=9, n_epochs=110, lr≈2.9e-4` |
 
 HPO gave a small, consistent gain for KNN/LUNAR/DIF (+0.3 to +1.1 pp),
 essentially no change for Deep SVDD (tuning round-tripped back to the
-same `[64,32]` architecture already used since Week 4) and no gain for
-Isolation Forest (0.7248 → 0.7239, within noise). The ranking is
-unchanged either way — Isolation Forest stays the best single method by
-a clear margin.
+same `[64,32]` architecture already used since Week 4). Isolation Forest
+got a small lift on a fresh Optuna re-run at PCA-147 with an expanded
+search space including `bootstrap` (0.7248 → **0.7277**, +0.3 pp; best
+params use a smaller `max_samples` subsample rather than the previous
+`max_samples=1.0` solution). **INNE** gained slightly (+0.6 pp) and lands
+next to Isolation Forest after tuning. **LODA** gained a lot (+11 pp:
+0.60 → 0.71) but remains below IF/INNE and is high-variance under
+defaults. Ranking at the top is unchanged — Isolation Forest stays the
+best single method at PCA-147.
+
+Figures: `week6-tables/week6_step1_default_boxplot.png`,
+`week6_step1_tuned_boxplot.png`, `week6_step1_default_vs_tuned_boxplot.png`.
 
 Reproduce:
 ```bash
 python p53_od_pipeline.py --hpo --hpo-model isolation_forest --reduce pca --n-components 147 \
     --hpo-trials 150 --hpo-repeats 15 --hpo-final-repeats 25 --output-csv outputs/hpo_isolation_forest.csv
-# repeat for --hpo-model knn / deep_svdd / lunar, or --hpo-model all to run every model in one invocation
+# Isolation Forest re-run (bootstrap in search space):
+python benchmark_hpo_inne_loda.py --hpo-model isolation_forest --hpo-trials 150 --hpo-repeats 15 \
+    --hpo-final-repeats 25 --n-components 147 --sampler tpe \
+    --output-csv week6-tables/hpo_isolation_forest_pca147_rerun.csv
+# INNE / LODA (cached-split HPO script; writes week6-tables/hpo_{inne,loda}.csv):
+python benchmark_hpo_inne_loda.py --hpo-model all --hpo-trials 50 --hpo-repeats 15 --hpo-final-repeats 25
 
 python p53_od_pipeline.py --compare-methods --methods-set week6_final --reduce pca --n-components 147 --n-repeats 25 \
     --output-csv outputs/week6_final_default_auc_matrix.csv
 python p53_od_pipeline.py --compare-methods --methods-set week6_final --tuned --reduce pca --n-components 147 --n-repeats 25 \
     --output-csv outputs/week6_final_tuned_auc_matrix.csv
+python plot_week6_step1_boxplots.py
 ```
 
 ### Step 2 — reduction method sweep (Isolation Forest, 200 dims, 25 repeats)
@@ -839,10 +870,23 @@ PCA and Truncated SVD are statistically indistinguishable here (expected —
 Truncated SVD is PCA without centering). Random Projection and UMAP both
 underperform PCA/SVD by a wide margin.
 
+**INNE follow-up at 200 dims:** Step 1’s tuned INNE
+(`n_estimators=320, max_samples=11`) transferred from PCA-147 to PCA-200
+under the same 25-repeat OCC protocol:
+
+| | AUC |
+|---|-----|
+| INNE + PCA(147) + Step 1 tuned (from Step 1) | 0.7289 ± 0.0214 |
+| INNE + PCA(200) + Step 1 tuned | **0.7364 ± 0.0207** |
+
++0.75 pp vs PCA-147, but still slightly below Isolation Forest + PCA(200)
+defaults (0.7393). Same pattern as IF: n=200 helps; IF remains ahead.
+
 Reproduce:
 ```bash
 python p53_od_pipeline.py --method isolation_forest --reduce-sweep pca,random_projection,truncated_svd,umap \
     --n-components 200 --n-repeats 25 --output-csv outputs/week6_reduce_sweep_auc_matrix.csv
+python benchmark_inne_pca200_tuned.py
 ```
 
 ### Step 3 — feature bagging, Isolation Forest at 200 dims (default params, 25 repeats, 10 subsets)
@@ -861,10 +905,32 @@ Same small, consistent bagging gain (+0.5 to +0.9 pp) as the Week 5
 new best aggregation variant, and **0.7438 is the best result of the
 whole project so far.**
 
+**INNE + PCA(200) + Step 1 tuned** (`n_estimators=320, max_samples=11`),
+same bagging protocol (25 repeats, 10 subsets). No-bagging row is the
+Step 2 result (not re-run):
+
+| | AUC |
+|---|-----|
+| No bagging | 0.7364 ± 0.0207 |
+| Sum | **0.7395 ± 0.0187** |
+| Max | 0.7306 ± 0.0205 |
+| AOM | 0.7375 ± 0.0196 |
+| Pruned | 0.7387 ± 0.0196 |
+| Damped | **0.7395 ± 0.0187** |
+
+Small bagging lift for Sum/Damped (+0.3 pp vs no-bagging). Max hurts.
+None of the INNE bagging variants reach IF’s pruned result (0.7438).
+
+Figures: `week6-tables/week6_step3_if_bagging_boxplot.png`,
+`week6_step3_inne_bagging_boxplot.png`,
+`week6_step3_if_vs_inne_bagging_boxplot.png`.
+
 Reproduce:
 ```bash
 python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 200 --n-repeats 25 \
     --output-csv outputs/week6_feature_bagging_if_pca200.csv
+python benchmark_inne_pca200_feature_bagging.py
+python plot_week6_step3_boxplots.py
 ```
 
 ### Step 4 — feature bagging, Isolation Forest at 200 dims, with HPO-tuned params
@@ -916,21 +982,36 @@ python p53_od_pipeline.py --feature-bagging --bagging-methods isolation_forest -
     --output-csv outputs/week6_feature_bagging_if_svd200_tuned.csv
 ```
 
-### Week 6 best (OCC deliverable)
+### Week 6 best
 
-n_components=200 (Step 2) turned out to matter more than HPO (Steps 1
-and 4) — dimensionality choice beat hyperparameter tuning as the more
-effective lever this week, for Isolation Forest specifically.
+n_components=200 (Step 2) mattered more than HPO (Steps 1 and 4) for
+Isolation Forest. Tuned INNE at PCA-200 is competitive but does not
+overtake IF + bagging. Ranked by 25-repeat train AUC (OCC) unless noted.
+
+**OCC (labels never in `.fit()`):**
 
 | Rank | Configuration | AUC | Why |
 |------|---------------|-----|-----|
-| **1 (use this)** | **Isolation Forest + PCA (200) + StandardScaler + feature bagging (Pruned, default IF params, random subspaces)** | **0.7438 ± 0.0199** | Best result of the project so far; simple, no HPO needed |
-| 2 | Isolation Forest + PCA (200) + scale (no bagging) | 0.7392 ± 0.0233 | Confirms n=200 > n=147 (0.7248) independent of bagging |
-| 3 | Isolation Forest + Truncated SVD (200) + feature bagging (AOM, tuned params) | 0.7349 ± 0.0204 | Truncated SVD ties PCA on raw AUC (Step 2) but tuning + bagging together still land below PCA's untuned result |
-| — | Isolation Forest + PCA (200), HPO-tuned (no bagging) | 0.7372 ± 0.0218 | HPO gave no measurable gain over defaults at this dimensionality |
-| — | DIF / KNN / LUNAR / Deep SVDD (147 dims, tuned) | 0.6849–0.7087 | All below Isolation Forest; DIF and KNN benefited most from HPO among the non-IF models |
+| **1 (deliverable)** | **IF + PCA(200) + scale + feature bagging (Pruned, default IF)** | **0.7438 ± 0.0199** | Best OCC result; simple, no HPO |
+| 2 | INNE + PCA(200) + Step 1 tuned + bagging (Sum / Damped) | 0.7395 ± 0.0187 | Best INNE this week; ~0.4 pp below IF pruned |
+| 3 | IF + PCA(200) + scale (no bagging) | 0.7392 ± 0.0233 | n=200 > n=147 even without bagging |
+| 4 | IF + PCA(200), HPO-tuned (no bagging) | 0.7372 ± 0.0218 | HPO does not beat Step 3 defaults |
+| 5 | INNE + PCA(200) + Step 1 tuned (no bagging) | 0.7364 ± 0.0207 | +0.75 pp vs tuned INNE @147 |
+| 6 | IF + Truncated SVD(200) + bagging (AOM, tuned) | 0.7349 ± 0.0204 | SVD≈PCA raw; tuned bagging still below IF@PCA defaults |
+| — | INNE + PCA(147) + Step 1 tuned | 0.7289 ± 0.0214 | Closest non-IF single method at 147 dims |
+| — | DIF / KNN / LUNAR / Deep SVDD / LODA (147, tuned) | 0.6849–0.7120 | Below IF/INNE; LODA 0.60→0.71 from defaults |
 
-**Pipeline command for the Week 6 winner:**
+**Exploratory (not OCC — SMOTE uses labels in `.fit()`):**
+
+| Configuration | AUC | Note |
+|---------------|-----|------|
+| GMD + LOF + Random Projection(147) + scale + SMOTE | **0.8930 ± 0.0389** (3-fold CV) | Highest numeric train CV; label-contaminated |
+| GMD + LOF + Random Projection(200) + scale + SMOTE | 0.8892 ± 0.0364 (3-fold CV) | Same protocol at 200 dims; still exploratory |
+
+Held-out test numbers for the main configs are in
+**Final train / held-out test AUC** below.
+
+**Pipeline command for the Week 6 OCC deliverable:**
 
 ```bash
 python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 200 \
@@ -939,8 +1020,34 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 
 Use **pruned** aggregation when reading Step 3 output
 (`isolation_forest_pruned` column in
-`outputs/week6_feature_bagging_if_pca200.csv`). Labels are for evaluation
-only — never passed into `.fit()`.
+`outputs/week6_feature_bagging_if_pca200.csv` / `week6-tables/week6_feature_bagging_if_pca200.csv`).
+Labels are for evaluation only — never passed into `.fit()`.
 
-----------------------------------------------------
-OMAR,IF YOU SEE THIS; YOU CAN TRY OUT OVERSAMPLING, CLASSIFICATION MODELS OR ANOTHER IDEAS :)
+## Final train / held-out test AUC (Week 6 wrap-up)
+
+Best OCC and label-using (GMD+LOF + SMOTE) models, refit on **all** train
+data and scored on the held-out test set from `split_data.py` (labels in
+`_internal_test_labels_DO_NOT_USE_IN_PIPELINE.csv` only — never used for
+fitting). Test set: 12 active / 6139 inactive.
+
+| Setting | Model | Train AUC | Test AUC |
+|---------|-------|-----------|----------|
+| OCC | Isolation Forest + PCA(200) + StandardScaler + feature bagging (pruned) | 0.7532 | **0.8431** |
+| OCC | Isolation Forest + PCA(147) + StandardScaler + feature bagging (pruned) | 0.7298 | 0.8153 |
+| Label-using (SMOTE) | GMD + LOF + Random Projection(147) + scale + SMOTE | 0.8930 ± 0.0389 (3-fold CV) | **0.9452** |
+| Label-using (SMOTE) | GMD + LOF + Random Projection(200) + scale + SMOTE | 0.8892 ± 0.0364 (3-fold CV) | **0.9366** |
+
+**How Train / Test AUC were obtained**
+
+- **OCC Train AUC:** fit on train inliers only, score the full train set
+  (post-hoc).
+- **OCC Test AUC:** same fitted model, score `test_set_p53mutant.parquet`.
+- **SMOTE Train AUC:** 3-fold stratified CV on train (same protocol as the
+  Week 2 GMD tables). Post-hoc train AUC after a full-train SMOTE fit is
+  not usable (~0.02): SMOTE densifies the minority region so original
+  actives look “normal” to LOF on the training distribution.
+- **SMOTE Test AUC:** fit scale → SMOTE → RP → GMD+LOF on all train, then
+  score the held-out test set.
+
+Script / CSV: `benchmark_final_train_test_auc.py`,
+`outputs/final_train_test_auc.csv`.
