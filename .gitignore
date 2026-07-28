@@ -11,4 +11,3 @@ __pycache__/
 *.parquet
 *.pdf
 !week6-tables/*.csv
-!week6-tables/*.png
