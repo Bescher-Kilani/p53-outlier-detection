@@ -50,10 +50,10 @@ TabPFN needs a HuggingFace login and V-GAN needs extra steps, see the full docum
 
 ## Try it without the real data
 
-`make_synthetic_data.py` creates random data in the same format (5,408 features, a few empty and duplicate rows, ~50:1 imbalance). It shows that the code runs end to end. The numbers are meaningless for the real task.
+`tools/make_synthetic_data.py` creates random data in the same format (5,408 features, a few empty and duplicate rows, ~50:1 imbalance). It shows that the code runs end to end. The numbers are meaningless for the real task.
 
 ```bash
-python make_synthetic_data.py          # writes synthetic/train_data.data and synthetic/train_gt.csv
+python tools/make_synthetic_data.py          # writes synthetic/train_data.data and synthetic/train_gt.csv
 cd synthetic
 python ../split_data.py                # clean + stratified train/test split
 python ../p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 50
@@ -78,12 +78,10 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 ├── p53_od_pipeline.py      # outlier detection pipeline, all experiments via CLI flags
 ├── split_data.py           # cleaning + stratified train/test split
 ├── mrmr_ifs.py             # mRMR + IFS feature selection
-├── eval_internal_test_auc.py
-├── compute_correlations.py
-├── pca_2d_3d_blocks*.py
-├── benchmark_*.py          # Week 4-6 experiments
-├── plot_week6_*.py
-├── make_synthetic_data.py
+├── analysis/               # Week 1-3: correlations, block-wise PCA
+├── benchmarks/             # Week 4-6 experiments (Deep SVDD, HPO, INNE, final AUC)
+├── plots/                  # Week 6 boxplots
+├── tools/                  # synthetic demo data, own evaluation helper
 ├── notebooks/              # data exploration
 ├── docs/                   # full documentation
 ├── outputs/                # AUC matrices and significance tables (predictions are not published)

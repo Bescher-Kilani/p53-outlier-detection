@@ -1,6 +1,9 @@
 """Tuned INNE (README Step 1) with PCA-200 instead of PCA-147."""
 import argparse
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root, so p53_od_pipeline can be imported
 from p53_od_pipeline import (
 	TUNED_PARAMS,
 	build_hpo_detector,

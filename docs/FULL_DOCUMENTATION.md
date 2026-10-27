@@ -26,7 +26,7 @@ The pipeline expects the raw files in the repository root:
 - `train_data.data`: comma-separated, 31,020 rows × 5,408 features (2D electrostatic/surface block: 4,826 columns; 3D distance-based block: 582 columns) plus one empty trailing artifact column, `?` marks missing values
 - `train_gt.csv`: labels (`active` / `inactive`), 61 of 30,754 cleaned rows are active
 
-No data is needed to try the code: `make_synthetic_data.py` creates random data in the same format (see [README](../README.md#try-it-without-the-real-data)). Results on it say nothing about the real task.
+No data is needed to try the code: `tools/make_synthetic_data.py` creates random data in the same format (see [README](../README.md#try-it-without-the-real-data)). Results on it say nothing about the real task.
 
 ## Repo structure
 
@@ -38,16 +38,20 @@ No data is needed to try the code: `make_synthetic_data.py` creates random data 
 │   └── figures/
 ├── notebooks/
 │   └── data_exploration.ipynb     # exploration, correlation and PCA plots (not needed to run the pipeline)
-├── split_data.py                  # cleans the raw data, creates the stratified train/test split
 ├── p53_od_pipeline.py             # outlier detection pipeline (the deliverable)
-├── eval_internal_test_auc.py      # own check of the final prediction (not part of the pipeline)
+├── split_data.py                  # cleans the raw data, creates the stratified train/test split
 ├── mrmr_ifs.py                    # mRMR + IFS feature selector (Week 2)
-├── compute_correlations.py        # Pearson/Spearman/MI via BLAS matmul (heavy, run on a compute server)
-├── pca_2d_3d_blocks.py            # separate PCA on 2D/3D feature blocks (Week 3)
-├── pca_2d_3d_blocks_cv.py         # CV check for the block-PCA representation (Week 3)
-├── benchmark_*.py                 # Week 4-6 experiments (Deep SVDD, HPO, INNE, final train/test AUC, ...)
-├── plot_week6_*.py                # Week 6 boxplots
-├── make_synthetic_data.py         # random demo data in the raw format
+├── analysis/
+│   ├── compute_correlations.py    # Pearson/Spearman/MI via BLAS matmul (heavy, run on a compute server)
+│   ├── pca_2d_3d_blocks.py        # separate PCA on 2D/3D feature blocks (Week 3)
+│   └── pca_2d_3d_blocks_cv.py     # CV check for the block-PCA representation (Week 3)
+├── benchmarks/
+│   └── benchmark_*.py             # Week 4-6 experiments (Deep SVDD, HPO, INNE, final train/test AUC, ...)
+├── plots/
+│   └── plot_week6_*.py            # Week 6 boxplots
+├── tools/
+│   ├── make_synthetic_data.py     # random demo data in the raw format
+│   └── eval_internal_test_auc.py  # own check of the final prediction (not part of the pipeline)
 ├── outputs_week5_sig/, week6-tables/  # result tables and plots
 ├── requirements.txt
 └── setup.sh
@@ -57,26 +61,26 @@ Not in the repository: the raw data and everything derived from it (`*.data`, `*
 
 ## Scripts and files
 
-All scripts live in the repository root because they import each other (`p53_od_pipeline.py` is the shared library). Run them from the folder that contains the data files. Week numbers refer to the course schedule.
+The core (`p53_od_pipeline.py`, `split_data.py`, `mrmr_ifs.py`) lives in the repository root; everything else is grouped in subfolders and imports the pipeline from the root. Always run scripts from the repository root (or the folder that contains the data files), e.g. `python benchmarks/benchmark_hpo_inne_loda.py`. Week numbers refer to the course schedule.
 
 | File | Week | What it does |
 |---|---|---|
 | `split_data.py` | 1–2 | Cleans the raw file (empty rows, rows without the 2D block, duplicates), writes the stratified train/test split |
-| `compute_correlations.py` | 1 | Pearson, Spearman and mutual-information matrices for all 5,408 features via matrix multiplication (heavy, input for the notebook) |
+| `analysis/compute_correlations.py` | 1 | Pearson, Spearman and mutual-information matrices for all 5,408 features via matrix multiplication (heavy, input for the notebook) |
 | `mrmr_ifs.py` | 2 | mRMR + IFS feature selector, used through `--feature-select` in the pipeline |
-| `benchmark_gmd_lof_rp_smote_cv.py` | 2, 6 | CV-only run of GMD + LOF + Random Projection + scaling + SMOTE (the label-using, exploratory configuration) |
-| `pca_2d_3d_blocks.py`, `pca_2d_3d_blocks_cv.py` | 3 | Separate PCA on the 2D and 3D feature blocks and a CV check of the resulting representation |
+| `benchmarks/benchmark_gmd_lof_rp_smote_cv.py` | 2, 6 | CV-only run of GMD + LOF + Random Projection + scaling + SMOTE (the label-using, exploratory configuration) |
+| `analysis/pca_2d_3d_blocks.py`, `analysis/pca_2d_3d_blocks_cv.py` | 3 | Separate PCA on the 2D and 3D feature blocks and a CV check of the resulting representation |
 | `p53_od_pipeline.py` | 1–6 | The pipeline: all detectors, reductions, feature bagging, ensembles, HPO and statistical tests via CLI flags (`--help`) |
-| `benchmark_deep_svdd_week4.py` | 4 | Adds Deep SVDD to the Week 4 AUC matrices and re-runs the Friedman + Conover-Iman tests |
-| `benchmark_new_ensembles_occ.py` | 6 | Step 1: INNE and LODA next to Isolation Forest with the same protocol (scale → PCA(147) → detector, inlier-only fit, 25 repeats). Documents which other methods from the literature list were skipped and why (DIF already tried, XGBOD needs labels, SUOD is no detector, LSCP does not scale) |
-| `benchmark_hpo_inne_loda.py` | 6 | Step 1: Optuna HPO for INNE, LODA and the Isolation Forest re-run (cached splits, writes `week6-tables/hpo_*.csv`) |
-| `benchmark_if_pca_ncomponents_sweep.py` | 6 | Step 2: coarse sweep of `n_components` for Isolation Forest + PCA (10 to 300, plus values around 147), 25 repeats, reports the difference to 147 components |
-| `benchmark_inne_pca200_tuned.py` | 6 | Step 2: tuned INNE transferred from PCA(147) to PCA(200) |
-| `benchmark_inne_pca200_feature_bagging.py` | 6 | Step 3: feature bagging with tuned INNE at PCA(200) |
-| `benchmark_final_train_test_auc.py` | 6 | Final refit on all train data and scoring of the held-out test set (OCC and SMOTE models), writes `outputs/final_train_test_auc.csv` |
-| `plot_week6_step1_boxplots.py`, `plot_week6_step3_boxplots.py` | 6 | Boxplots of the per-repeat AUCs, written to `week6-tables/` |
-| `eval_internal_test_auc.py` | 2–6 | Scores a saved prediction against the held-back test labels (own check, not part of the pipeline) |
-| `make_synthetic_data.py` | – | Random demo data in the raw format, so the code can run without the real data |
+| `benchmarks/benchmark_deep_svdd_week4.py` | 4 | Adds Deep SVDD to the Week 4 AUC matrices and re-runs the Friedman + Conover-Iman tests |
+| `benchmarks/benchmark_new_ensembles_occ.py` | 6 | Step 1: INNE and LODA next to Isolation Forest with the same protocol (scale → PCA(147) → detector, inlier-only fit, 25 repeats). Documents which other methods from the literature list were skipped and why (DIF already tried, XGBOD needs labels, SUOD is no detector, LSCP does not scale) |
+| `benchmarks/benchmark_hpo_inne_loda.py` | 6 | Step 1: Optuna HPO for INNE, LODA and the Isolation Forest re-run (cached splits, writes `week6-tables/hpo_*.csv`) |
+| `benchmarks/benchmark_if_pca_ncomponents_sweep.py` | 6 | Step 2: coarse sweep of `n_components` for Isolation Forest + PCA (10 to 300, plus values around 147), 25 repeats, reports the difference to 147 components |
+| `benchmarks/benchmark_inne_pca200_tuned.py` | 6 | Step 2: tuned INNE transferred from PCA(147) to PCA(200) |
+| `benchmarks/benchmark_inne_pca200_feature_bagging.py` | 6 | Step 3: feature bagging with tuned INNE at PCA(200) |
+| `benchmarks/benchmark_final_train_test_auc.py` | 6 | Final refit on all train data and scoring of the held-out test set (OCC and SMOTE models), writes `outputs/final_train_test_auc.csv` |
+| `plots/plot_week6_step1_boxplots.py`, `plots/plot_week6_step3_boxplots.py` | 6 | Boxplots of the per-repeat AUCs, written to `week6-tables/` |
+| `tools/eval_internal_test_auc.py` | 2–6 | Scores a saved prediction against the held-back test labels (own check, not part of the pipeline) |
+| `tools/make_synthetic_data.py` | – | Random demo data in the raw format, so the code can run without the real data |
 
 **Result tables and plots**
 
@@ -148,7 +152,7 @@ experimental upstream (works fine here, just prints an
 4. Check the prediction against the internal test labels (our own
    sanity check, separate from the pipeline):
    ```bash
-   python eval_internal_test_auc.py
+   python tools/eval_internal_test_auc.py
    ```
 
 ## Notebook (exploration only)
@@ -156,7 +160,7 @@ experimental upstream (works fine here, just prints an
 `notebooks/data_exploration.ipynb` documents the original exploration:
 structure inspection, missing-value analysis, the cleaning logic later
 ported into `split_data.py`, and the correlation/PCA analysis
-(`compute_correlations.py` runs the heavy Pearson/Spearman/MI computation
+(`analysis/compute_correlations.py` runs the heavy Pearson/Spearman/MI computation
 on a compute server; results are copied back and plotted in the notebook).
 Not required to reproduce the pipeline above. The raw-data preview in cell 2 has no output here because the data is not published.
 
@@ -257,7 +261,7 @@ PCA separately on the 2D (electrostatic/surface) and 3D (distance-based)
 blocks, then relate them — instead of the single PCA over all 5,408
 mixed columns used elsewhere.
 
-Two-stage (`pca_2d_3d_blocks.py`): PCA per block to 95% variance,
+Two-stage (`analysis/pca_2d_3d_blocks.py`): PCA per block to 95% variance,
 concatenate, PCA again to 95% variance:
 
 | Stage | Raw dimensions | Components for 95% variance |
@@ -272,7 +276,7 @@ structural model (surface charge and distance displacement as two views
 of the same structural change).
 
 CV check with Isolation Forest on the 62-dim. result
-(`pca_2d_3d_blocks_cv.py`):
+(`analysis/pca_2d_3d_blocks_cv.py`):
 
 | Setup | CV AUC |
 |-------|--------|
@@ -488,7 +492,7 @@ python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 147 --n-
     --output-csv outputs/auc_feature_bagging_matrix.csv
 
 # Deep SVDD added later (same OCC setup: PCA 147 + scale, inlier-only fit):
-python benchmark_deep_svdd_week4.py --n-repeats 25 --n-subsets 10
+python benchmarks/benchmark_deep_svdd_week4.py --n-repeats 25 --n-subsets 10
 
 python p53_od_pipeline.py --stat-test outputs/auc_matrix_compare_methods.csv \
     --output-csv outputs/significance_table_compare_methods.csv
@@ -825,8 +829,8 @@ Course topic: Novel Techniques in OD for Large Databases.
 4. **Step 4** — does IF HPO at 200 dims beat Step 3 defaults? (no)
 5. **Held-out test** — full-train fit → internal test AUC (end of README)
 
-Plots (README mean±std → seaborn boxplots): `plot_week6_step1_boxplots.py`,
-`plot_week6_step3_boxplots.py` → PNGs under `week6-tables/`.
+Plots (README mean±std → seaborn boxplots): `plots/plot_week6_step1_boxplots.py`,
+`plots/plot_week6_step3_boxplots.py` → PNGs under `week6-tables/`.
 
 ### Step 1 — HPO for OCC models (Optuna, PCA-147)
 
@@ -887,17 +891,17 @@ Reproduce:
 python p53_od_pipeline.py --hpo --hpo-model isolation_forest --reduce pca --n-components 147 \
     --hpo-trials 150 --hpo-repeats 15 --hpo-final-repeats 25 --output-csv outputs/hpo_isolation_forest.csv
 # Isolation Forest re-run (bootstrap in search space):
-python benchmark_hpo_inne_loda.py --hpo-model isolation_forest --hpo-trials 150 --hpo-repeats 15 \
+python benchmarks/benchmark_hpo_inne_loda.py --hpo-model isolation_forest --hpo-trials 150 --hpo-repeats 15 \
     --hpo-final-repeats 25 --n-components 147 --sampler tpe \
     --output-csv week6-tables/hpo_isolation_forest_pca147_rerun.csv
 # INNE / LODA (cached-split HPO script; writes week6-tables/hpo_{inne,loda}.csv):
-python benchmark_hpo_inne_loda.py --hpo-model all --hpo-trials 50 --hpo-repeats 15 --hpo-final-repeats 25
+python benchmarks/benchmark_hpo_inne_loda.py --hpo-model all --hpo-trials 50 --hpo-repeats 15 --hpo-final-repeats 25
 
 python p53_od_pipeline.py --compare-methods --methods-set week6_final --reduce pca --n-components 147 --n-repeats 25 \
     --output-csv outputs/week6_final_default_auc_matrix.csv
 python p53_od_pipeline.py --compare-methods --methods-set week6_final --tuned --reduce pca --n-components 147 --n-repeats 25 \
     --output-csv outputs/week6_final_tuned_auc_matrix.csv
-python plot_week6_step1_boxplots.py
+python plots/plot_week6_step1_boxplots.py
 ```
 
 ### Step 2 — reduction method sweep (Isolation Forest, 200 dims, 25 repeats)
@@ -934,7 +938,7 @@ Reproduce:
 ```bash
 python p53_od_pipeline.py --method isolation_forest --reduce-sweep pca,random_projection,truncated_svd,umap \
     --n-components 200 --n-repeats 25 --output-csv outputs/week6_reduce_sweep_auc_matrix.csv
-python benchmark_inne_pca200_tuned.py
+python benchmarks/benchmark_inne_pca200_tuned.py
 ```
 
 ### Step 3 — feature bagging, Isolation Forest at 200 dims (default params, 25 repeats, 10 subsets)
@@ -977,8 +981,8 @@ Reproduce:
 ```bash
 python p53_od_pipeline.py --feature-bagging --reduce pca --n-components 200 --n-repeats 25 \
     --output-csv outputs/week6_feature_bagging_if_pca200.csv
-python benchmark_inne_pca200_feature_bagging.py
-python plot_week6_step3_boxplots.py
+python benchmarks/benchmark_inne_pca200_feature_bagging.py
+python plots/plot_week6_step3_boxplots.py
 ```
 
 ### Step 4 — feature bagging, Isolation Forest at 200 dims, with HPO-tuned params
@@ -1097,5 +1101,5 @@ fitting). Test set: 12 active / 6139 inactive.
 - **SMOTE Test AUC:** fit scale → SMOTE → RP → GMD+LOF on all train, then
   score the held-out test set.
 
-Script / CSV: `benchmark_final_train_test_auc.py`,
+Script / CSV: `benchmarks/benchmark_final_train_test_auc.py`,
 `outputs/final_train_test_auc.csv`.

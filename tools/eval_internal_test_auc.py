@@ -4,6 +4,9 @@
 # p53_od_pipeline.py itself.
 import pandas as pd
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root, so p53_od_pipeline can be imported
 from p53_od_pipeline import evaluate_labeled_scores
 
 PREDICTION_FILE = "outputs/team2_prediction.csv"

@@ -8,6 +8,9 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root, so p53_od_pipeline can be imported
 from p53_od_pipeline import (
 	_best_mcc_threshold,
 	anomaly_scores,

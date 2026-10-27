@@ -17,6 +17,9 @@ import optuna
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))  # repo root, so p53_od_pipeline can be imported
 from p53_od_pipeline import (
 	HPO_PARAM_SPACES,
 	_repeated_split_indices,
