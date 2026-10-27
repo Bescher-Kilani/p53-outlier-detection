@@ -92,6 +92,8 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 └── setup.sh
 ```
 
+Every script and result table is described in [docs/FULL_DOCUMENTATION.md](docs/FULL_DOCUMENTATION.md#scripts-and-files).
+
 ## Authors
 
 Team 2, Data Science Lab 2026, Karlsruhe Institute of Technology.

@@ -55,6 +55,39 @@ No data is needed to try the code: `make_synthetic_data.py` creates random data 
 
 Not in the repository: the raw data and everything derived from it (`*.data`, `*.parquet`, label files, `outputs/` predictions) and the V-GAN source (`vgan_lib/`).
 
+## Scripts and files
+
+All scripts live in the repository root because they import each other (`p53_od_pipeline.py` is the shared library). Run them from the folder that contains the data files. Week numbers refer to the course schedule.
+
+| File | Week | What it does |
+|---|---|---|
+| `split_data.py` | 1–2 | Cleans the raw file (empty rows, rows without the 2D block, duplicates), writes the stratified train/test split |
+| `compute_correlations.py` | 1 | Pearson, Spearman and mutual-information matrices for all 5,408 features via matrix multiplication (heavy, input for the notebook) |
+| `mrmr_ifs.py` | 2 | mRMR + IFS feature selector, used through `--feature-select` in the pipeline |
+| `benchmark_gmd_lof_rp_smote_cv.py` | 2, 6 | CV-only run of GMD + LOF + Random Projection + scaling + SMOTE (the label-using, exploratory configuration) |
+| `pca_2d_3d_blocks.py`, `pca_2d_3d_blocks_cv.py` | 3 | Separate PCA on the 2D and 3D feature blocks and a CV check of the resulting representation |
+| `p53_od_pipeline.py` | 1–6 | The pipeline: all detectors, reductions, feature bagging, ensembles, HPO and statistical tests via CLI flags (`--help`) |
+| `benchmark_deep_svdd_week4.py` | 4 | Adds Deep SVDD to the Week 4 AUC matrices and re-runs the Friedman + Conover-Iman tests |
+| `benchmark_new_ensembles_occ.py` | 6 | Step 1: INNE and LODA next to Isolation Forest with the same protocol (scale → PCA(147) → detector, inlier-only fit, 25 repeats). Documents which other methods from the literature list were skipped and why (DIF already tried, XGBOD needs labels, SUOD is no detector, LSCP does not scale) |
+| `benchmark_hpo_inne_loda.py` | 6 | Step 1: Optuna HPO for INNE, LODA and the Isolation Forest re-run (cached splits, writes `week6-tables/hpo_*.csv`) |
+| `benchmark_if_pca_ncomponents_sweep.py` | 6 | Step 2: coarse sweep of `n_components` for Isolation Forest + PCA (10 to 300, plus values around 147), 25 repeats, reports the difference to 147 components |
+| `benchmark_inne_pca200_tuned.py` | 6 | Step 2: tuned INNE transferred from PCA(147) to PCA(200) |
+| `benchmark_inne_pca200_feature_bagging.py` | 6 | Step 3: feature bagging with tuned INNE at PCA(200) |
+| `benchmark_final_train_test_auc.py` | 6 | Final refit on all train data and scoring of the held-out test set (OCC and SMOTE models), writes `outputs/final_train_test_auc.csv` |
+| `plot_week6_step1_boxplots.py`, `plot_week6_step3_boxplots.py` | 6 | Boxplots of the per-repeat AUCs, written to `week6-tables/` |
+| `eval_internal_test_auc.py` | 2–6 | Scores a saved prediction against the held-back test labels (own check, not part of the pipeline) |
+| `make_synthetic_data.py` | – | Random demo data in the raw format, so the code can run without the real data |
+
+**Result tables and plots**
+
+| Folder | Content |
+|---|---|
+| `outputs/` | Per-repeat AUC matrices (25 repeats × configurations) and significance tables from Weeks 3–4 (Isolation Forest, KNN, OCSVM, ABOD, LOF, Deep SVDD, feature bagging) |
+| `outputs_week5_sig/` | Week 5 Friedman + Conover-Iman significance tables: 7 methods, feature bagging with random vs. V-GAN subspaces, heterogeneous ensemble |
+| `week6-tables/` | Week 6: `hpo_*.csv` (Optuna trials per model) with `*_final_summary.csv` (25-repeat check of the best parameters), `week6_final_*_auc_matrix.csv` (default vs. tuned), `week6_reduce_sweep_auc_matrix*.csv` (reduction sweep and extra runs at 187 and 200 components), `week6_feature_bagging_*.csv` (bagging results) and the boxplot PNGs |
+
+Predictions, raw data and everything derived from the raw data are not published.
+
 ## Setup
 
 ```bash
