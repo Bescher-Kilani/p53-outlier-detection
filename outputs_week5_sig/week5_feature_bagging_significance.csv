@@ -1,0 +1,7 @@
+,isolation_forest_no_bagging,isolation_forest_sum,isolation_forest_max,isolation_forest_aom,isolation_forest_pruned,isolation_forest_damped
+isolation_forest_no_bagging,,--,--,--,--,--
+isolation_forest_sum,++,,,,,
+isolation_forest_max,++,,,-,,
+isolation_forest_aom,++,,+,,++,
+isolation_forest_pruned,++,,,--,,--
+isolation_forest_damped,++,,,,++,

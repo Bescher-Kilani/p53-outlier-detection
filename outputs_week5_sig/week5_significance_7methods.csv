@@ -1,0 +1,8 @@
+,isolation_forest,lof,knn,ocsvm,abod,deep_svdd,tabpfn
+isolation_forest,,++,++,++,++,++,++
+lof,--,,--,--,--,--,--
+knn,--,++,,++,++,,--
+ocsvm,--,++,--,,++,--,--
+abod,--,++,--,--,,--,--
+deep_svdd,--,++,,++,++,,--
+tabpfn,--,++,++,++,++,++,

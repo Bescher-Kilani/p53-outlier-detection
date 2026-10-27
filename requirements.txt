@@ -10,3 +10,6 @@ scikit-posthocs
 tabpfn
 tabpfn-extensions
 optuna
+# notebook
+jupyter
+dataframe_image

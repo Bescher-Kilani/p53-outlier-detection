@@ -1,13 +1,33 @@
-train_data.data
-train_data_clean.parquet
-pearson_corr.parquet
-spearman_corr.parquet
-__pycache__/
-.ipynb_checkpoints/
-*.pyc
-*.png
-*.csv
-.~lock.*#
+# Data provided by the course supervisors (not redistributed) and files derived from it
+*.data
 *.parquet
+train_gt.csv
+train_labels_p53mutant.csv
+_internal_test_labels_*.csv
+data_overview_table.png
+synthetic/
+
+# Predictions and run outputs (the AUC matrices and significance tables are kept)
+outputs/*
+!outputs/auc_feature_bagging_matrix.csv
+!outputs/auc_matrix_compare_methods.csv
+!outputs/significance_table_5methods.csv
+!outputs/significance_table_feature_bagging.csv
+
+# Third-party code (clone it yourself, see docs/FULL_DOCUMENTATION.md)
+vgan_lib/
+
+# Course slides, loose images in the repository root
 *.pdf
-!week6-tables/*.csv
+*.pptx
+*.odp
+/*.png
+
+# Python, notebooks, editors
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.~lock.*#
+.vscode/
+.DS_Store
