@@ -4,6 +4,8 @@ Finding p53 mutants that lose the protein's protective function, using unsupervi
 
 p53 acts as a checkpoint that stops damaged cells from dividing. Mutations that disable it are involved in roughly half of all human cancers. The task is **one-class classification (OCC)**: models are fit on the data without labels. Labels are used only to compute the AUC afterwards, never for `.fit()` or tuning.
 
+![Pipeline overview](docs/figures/01_pipeline.png)
+
 ## Results
 
 Best OCC model: **Isolation Forest + PCA(200) + StandardScaler + feature bagging (pruned aggregation)**.
@@ -18,9 +20,11 @@ Best OCC model: **Isolation Forest + PCA(200) + StandardScaler + feature bagging
 
 Exploratory only (not OCC, uses labels through SMOTE): GMD + LOF + Random Projection + SMOTE reaches 0.945 test AUC.
 
-![Isolation Forest vs. INNE with feature bagging](week6-tables/week6_step3_if_vs_inne_bagging_boxplot.png)
+![Final OCC models: train vs. held-out test AUC](docs/figures/08_final_train_test.png)
 
 ## What we did, week by week
+
+![Best OCC AUC per week](docs/figures/07_progress.png)
 
 | Week | Topic | Key finding |
 |---|---|---|
@@ -30,6 +34,16 @@ Exploratory only (not OCC, uses labels through SMOTE): GMD + LOF + Random Projec
 | 4 | Statistical tests | Friedman + Conover-Iman: the method ranking and the bagging gain are significant. Deep SVDD added |
 | 5 | Outlier ensembles | TabPFN is a strong second. V-GAN subspaces give no gain over random ones. Mixing methods is worse than Isolation Forest alone |
 | 6 | HPO & high dimensions | 200 PCA components matter more than tuning (0.7248 → 0.7393, bagging: 0.7438). HPO gives no gain for Isolation Forest at 200 dims |
+
+### Key steps in plots
+
+| Detector comparison (Week 3-4) | Feature bagging (Week 3-6) |
+|---|---|
+| ![Detector comparison](docs/figures/04_detector_comparison.png) | ![Feature bagging gain](docs/figures/05_feature_bagging_gain.png) |
+
+![Dimensionality reduction](docs/figures/03_dimensionality_reduction.png)
+
+![Hyperparameter optimization](docs/figures/06_hpo.png)
 
 Details, tables and significance results for every week: [docs/FULL_DOCUMENTATION.md](docs/FULL_DOCUMENTATION.md).
 
@@ -80,10 +94,10 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 ├── mrmr_ifs.py             # mRMR + IFS feature selection
 ├── analysis/               # Week 1-3: correlations, block-wise PCA
 ├── benchmarks/             # Week 4-6 experiments (Deep SVDD, HPO, INNE, final AUC)
-├── plots/                  # Week 6 boxplots
+├── plots/                  # process figures and Week 6 boxplots
 ├── tools/                  # synthetic demo data, own evaluation helper
 ├── notebooks/              # data exploration
-├── docs/                   # full documentation
+├── docs/                   # full documentation, figures/ (process plots)
 ├── outputs/                # AUC matrices and significance tables (predictions are not published)
 ├── outputs_week5_sig/, week6-tables/   # result tables and plots
 ├── requirements.txt
