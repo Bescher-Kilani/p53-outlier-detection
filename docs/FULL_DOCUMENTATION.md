@@ -17,6 +17,14 @@ features computed for ~31,000 p53 mutants, to explore which mutations
 disrupt this protective function. The target label is used for
 verification only — never for training or tuning — per the task rules.
 
+## Process at a glance
+
+![Pipeline overview](figures/01_pipeline.png)
+
+![Best OCC AUC per week](figures/07_progress.png)
+
+W2 is a 3-fold CV mean, W3-W6 are means over 25 repeated subsamples (inlier-only fit), so the first point is not strictly comparable. All figures are produced by `plots/plot_process_figures.py` from the per-repeat AUC matrices in `outputs/` and `week6-tables/`. The Week 1 and Week 2 panels and the final test AUC use the published table values.
+
 ## Data
 
 The data was provided by the course supervisors (KIT Data Science Lab 2026) and is **not included** in this repository and must not be redistributed.
@@ -35,7 +43,7 @@ No data is needed to try the code: `tools/make_synthetic_data.py` creates random
 ├── README.md
 ├── docs/
 │   ├── FULL_DOCUMENTATION.md      # this file
-│   └── figures/
+│   └── figures/                   # process plots (plots/plot_process_figures.py)
 ├── notebooks/
 │   └── data_exploration.ipynb     # exploration, correlation and PCA plots (not needed to run the pipeline)
 ├── p53_od_pipeline.py             # outlier detection pipeline (the deliverable)
@@ -78,7 +86,8 @@ The core (`p53_od_pipeline.py`, `split_data.py`, `mrmr_ifs.py`) lives in the rep
 | `benchmarks/benchmark_inne_pca200_tuned.py` | 6 | Step 2: tuned INNE transferred from PCA(147) to PCA(200) |
 | `benchmarks/benchmark_inne_pca200_feature_bagging.py` | 6 | Step 3: feature bagging with tuned INNE at PCA(200) |
 | `benchmarks/benchmark_final_train_test_auc.py` | 6 | Final refit on all train data and scoring of the held-out test set (OCC and SMOTE models), writes `outputs/final_train_test_auc.csv` |
-| `plots/plot_week6_step1_boxplots.py`, `plots/plot_week6_step3_boxplots.py` | 6 | Boxplots of the per-repeat AUCs, written to `week6-tables/` |
+| `plots/plot_process_figures.py` | 1–6 | The eight process figures used in the README and this document (pipeline, data, reduction, detectors, bagging, HPO, progress, final AUC), written to `docs/figures/`. Reads the per-repeat AUC matrices |
+| `plots/plot_week6_step1_boxplots.py`, `plots/plot_week6_step3_boxplots.py` | 6 | Boxplots written to `week6-tables/`. They draw 25 samples from N(mean, std) of the published table values, not the real per-repeat AUCs |
 | `tools/eval_internal_test_auc.py` | 2–6 | Scores a saved prediction against the held-back test labels (own check, not part of the pipeline) |
 | `tools/make_synthetic_data.py` | – | Random demo data in the raw format, so the code can run without the real data |
 
@@ -180,6 +189,8 @@ Not required to reproduce the pipeline above. The raw-data preview in cell 2 has
   to preserve outlier-driven variance)
 - Labels (verification only): 30,693 inactive / 61 active (~503:1)
 
+![Cleaning and class imbalance](figures/02_data_cleaning_imbalance.png)
+
 ## Week 2 — key findings
 
 - Pipeline rebuilt as two standalone scripts (`split_data.py`,
@@ -244,6 +255,10 @@ Not required to reproduce the pipeline above. The raw-data preview in cell 2 has
   | 1 | mRMR + IFS + Isolation Forest | **0.7511 ± 0.0466** | labels used for feature selection only |
   | 2 | Isolation Forest + PCA (147) + StandardScaler | **0.7291 ± 0.0543** | fully unsupervised fit |
   | 3 | GMD + LOF + Random Projection (147) + SMOTE | 0.8930 ± 0.0389 | labels via SMOTE; treat as exploratory |
+
+![Dimensionality reduction: Week 2 comparison and Week 6 sweep at 200 dims](figures/03_dimensionality_reduction.png)
+
+Left: Week 2 CV results (table above). Right: the same comparison repeated in Week 6 at 200 dims with 25 repeated subsamples (`week6-tables/week6_reduce_sweep_auc_matrix.csv`). PCA and Truncated SVD win both times.
 
 ## Week 3 — key findings
 
@@ -547,6 +562,8 @@ chi-square = 303.95, p ≈ 0.0000 → H0 rejected. Conover-Iman pairwise results
 | KNN | 0.6816 | **0.6861** | 0.6834 | 0.6852 |
 | OCSVM | 0.6891 | 0.6990 | **0.7012** | 0.6945 |
 | **Deep SVDD** | **0.6981 ± 0.0351** | 0.6747 ± 0.0235 | 0.6543 ± 0.0276 | 0.6726 ± 0.0231 |
+
+![Detector comparison over 25 repeats](figures/04_detector_comparison.png)
 
 **Significance table, Step A (6 methods):**
 
@@ -973,6 +990,10 @@ Step 2 result (not re-run):
 Small bagging lift for Sum/Damped (+0.3 pp vs no-bagging). Max hurts.
 None of the INNE bagging variants reach IF’s pruned result (0.7438).
 
+![Feature bagging gain for Isolation Forest at 147 and 200 dims](figures/05_feature_bagging_gain.png)
+
+Per-repeat AUC difference to `no_bagging` (same subsample, paired). The median gain is positive for every aggregation except that `max` is close to zero at 200 dims; individual repeats can still be negative.
+
 Figures: `week6-tables/week6_step3_if_bagging_boxplot.png`,
 `week6_step3_inne_bagging_boxplot.png`,
 `week6_step3_if_vs_inne_bagging_boxplot.png`.
@@ -1023,6 +1044,10 @@ repeats/trial) most likely landed on evaluation noise rather than a
 genuine improvement over well-chosen defaults. Unlike KNN/LUNAR/DIF in
 Step 1, HPO did not help Isolation Forest at either dimensionality tested
 this week.
+
+![HPO: default vs. tuned and Optuna history for Isolation Forest at 200 dims](figures/06_hpo.png)
+
+Left: per-repeat AUCs at PCA-147, default vs. tuned parameters (Step 1). Right: the 150 Optuna trials for Isolation Forest at 200 dims (15 repeats per trial, so slightly noisier than the 25-repeat reference line); no trial clearly beats the default parameters.
 
 Reproduce:
 ```bash
@@ -1088,6 +1113,8 @@ fitting). Test set: 12 active / 6139 inactive.
 | OCC | Isolation Forest + PCA(147) + StandardScaler + feature bagging (pruned) | 0.7298 | 0.8153 |
 | Label-using (SMOTE) | GMD + LOF + Random Projection(147) + scale + SMOTE | 0.8930 ± 0.0389 (3-fold CV) | **0.9452** |
 | Label-using (SMOTE) | GMD + LOF + Random Projection(200) + scale + SMOTE | 0.8892 ± 0.0364 (3-fold CV) | **0.9366** |
+
+![Final OCC models: train vs. held-out test AUC](figures/08_final_train_test.png)
 
 **How Train / Test AUC were obtained**
 
