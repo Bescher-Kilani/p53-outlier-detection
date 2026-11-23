@@ -234,23 +234,24 @@ def fig_hpo() -> None:
 
 
 def fig_progress() -> None:
-	"""Best OCC AUC per week (25-repeat protocol unless noted; values from the weekly tables)."""
-	weeks = ["W2\n(3-fold CV)", "W3", "W4", "W5", "W6"]
-	auc = [0.7291, 0.7248, 0.7310, 0.7314, 0.7438]
-	std = [0.0543, 0.0227, 0.0195, 0.0197, 0.0199]
-	labels = ["IF + PCA(147)", "IF, 5 detectors", "+ feature bagging", "+ TabPFN, V-GAN\n(no gain)",
+	"""Best OCC AUC per week (values from the weekly slides / Phase 2 report; protocols differ per week)."""
+	weeks = ["W2", "W3", "W4", "W5", "W6"]
+	auc = [0.7291, 0.7248, 0.7354, 0.7314, 0.7438]
+	labels = ["IF + PCA(147)", "IF, 5 detectors", "+ feature bagging\n(AOM)", "+ TabPFN, V-GAN\n(no gain)",
 		"PCA(200) + bagging\n(pruned)"]
 	fig, ax = plt.subplots(figsize=(9, 4))
 	x = np.arange(len(weeks))
-	ax.errorbar(x, auc, yerr=std, color=TEAL, marker="o", lw=2.2, capsize=4, ms=7)
-	for xi, a, sd, l in zip(x, auc, std, labels):
-		ax.text(xi, a + sd + 0.004, f"{a:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
-		ax.text(xi, 0.635, l, ha="center", va="center", fontsize=8, color=DARK)
+	ax.plot(x, auc, color=TEAL, marker="o", lw=2.2, ms=7)
+	for xi, a, l in zip(x, auc, labels):
+		ax.text(xi, a + 0.006, f"{a:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+		ax.text(xi, 0.705, l, ha="center", va="center", fontsize=8, color=DARK)
 	ax.set_xticks(x, weeks)
-	ax.set_ylim(0.62, 0.81)
+	ax.set_ylim(0.69, 0.76)
 	ax.set_xlim(-0.5, 4.5)
 	ax.set_ylabel("best OCC AUC")
-	ax.set_title("Progress: best OCC model per week (mean ± std; W2 over 3 folds, W3-6 over 25 repeats)", fontsize=10)
+	ax.set_title("Progress: best OCC model per week", fontsize=10)
+	fig.text(0.5, -0.02, "Protocols differ: W2 3-fold CV, W4 full-train post-hoc, W5/W6 repeated subsampling (as reported on the slides)",
+		ha="center", fontsize=7.5, color=DARK)
 	save(fig, "07_progress.png")
 
 

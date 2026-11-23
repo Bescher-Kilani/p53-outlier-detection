@@ -23,7 +23,7 @@ verification only — never for training or tuning — per the task rules.
 
 ![Best OCC AUC per week](figures/07_progress.png)
 
-W2 is a 3-fold CV mean, W3-W6 are means over 25 repeated subsamples (inlier-only fit), so the first point is not strictly comparable. All figures are produced by `plots/plot_process_figures.py` from the per-repeat AUC matrices in `outputs/` and `week6-tables/`. The Week 1 and Week 2 panels and the final test AUC use the published table values.
+The values are the ones reported on the weekly slides and in the Phase 2 report; the protocols differ (W2 3-fold CV mean, W4 full-train post-hoc, W5-W6 means over 25 repeated subsamples with inlier-only fit), so the points are not strictly comparable. All figures are produced by `plots/plot_process_figures.py` from the per-repeat AUC matrices in `outputs/` and `week6-tables/`. The Week 1 and Week 2 panels and the final test AUC use the published table values.
 
 ## Data
 
@@ -86,7 +86,7 @@ The core (`p53_od_pipeline.py`, `split_data.py`, `mrmr_ifs.py`) lives in the rep
 | `benchmarks/benchmark_inne_pca200_tuned.py` | 6 | Step 2: tuned INNE transferred from PCA(147) to PCA(200) |
 | `benchmarks/benchmark_inne_pca200_feature_bagging.py` | 6 | Step 3: feature bagging with tuned INNE at PCA(200) |
 | `benchmarks/benchmark_final_train_test_auc.py` | 6 | Final refit on all train data and scoring of the held-out test set (OCC and SMOTE models), writes `outputs/final_train_test_auc.csv` |
-| `plots/plot_process_figures.py` | 1–6 | The eight process figures used in the README and this document (pipeline, data, reduction, detectors, bagging, HPO, progress, final AUC), written to `docs/figures/`. Reads the per-repeat AUC matrices |
+| `plots/plot_process_figures.py` | 1–6 | The eight generated process figures (09-17 are slide extracts); used in the README and this document (pipeline, data, reduction, detectors, bagging, HPO, progress, final AUC), written to `docs/figures/`. Reads the per-repeat AUC matrices |
 | `plots/plot_week6_step1_boxplots.py`, `plots/plot_week6_step3_boxplots.py` | 6 | Boxplots written to `week6-tables/`. They draw 25 samples from N(mean, std) of the published table values, not the real per-repeat AUCs |
 | `tools/eval_internal_test_auc.py` | 2–6 | Scores a saved prediction against the held-back test labels (own check, not part of the pipeline) |
 | `tools/make_synthetic_data.py` | – | Random demo data in the raw format, so the code can run without the real data |
@@ -174,6 +174,10 @@ on a compute server; results are copied back and plotted in the notebook).
 Not required to reproduce the pipeline above. The raw-data preview in cell 2 has no output here because the data is not published.
 
 ## Week 1 — key findings
+
+![PCA: cumulative explained variance (slide, Week 1)](figures/09_pca_explained_variance.png)
+
+![Pearson, Spearman and mutual information over all 5,408 features (slide, Week 1)](figures/10_correlation_matrices.png)
 
 - Raw: 31,020 rows × 5,408 features (2D electrostatic/surface block,
   3D distance-based block) + 1 empty parsing artifact column
@@ -327,6 +331,8 @@ python p53_od_pipeline.py --method isolation_forest --reduce pca --n-components 
 single-method runs.)
 
 ### Step A — comparing OCC methods across all three families
+
+![Detector concepts: LOF/KNN, Isolation Forest, ABOD, OCSVM (slides, Week 3)](figures/11_detector_concepts.png)
 
 OD methods are grouped into three families: **locality-based**
 (LOF, KNN), **cluster-based** (OCSVM), **subspace-based**
@@ -634,6 +640,8 @@ aggregation variants.
 
 ### Step 1 — new OD methods
 
+![Week 5: detector boxplots incl. TabPFN and Deep SVDD (slide)](figures/15_week5_detector_boxplots.png)
+
 **TabPFN** (`--method tabpfn`) added: a zero-shot tabular foundation model,
 repurposed for unsupervised OD via Prior Labs' `TabPFNUnsupervisedModel`
 (estimates per-sample likelihood; low likelihood = anomalous). `fit(X)`
@@ -684,6 +692,12 @@ python p53_od_pipeline.py --stat-test outputs/week5_compare.csv \
 ```
 
 ### Step 2 — feature bagging: new aggregations + subspace source (Isolation Forest only)
+
+![Feature bagging with Pruned and Damped aggregation (slide)](figures/12_feature_bagging_concept.png)
+
+![V-GAN subspace generator (slide)](figures/13_vgan_subspace_generator.png)
+
+![Bagging: random vs. V-GAN subspaces (slide)](figures/16_week5_bagging_random_vs_vgan.png)
 
 Restricted to Isolation Forest only this step — feature bagging costs
 `n_repeats x n_subsets` fits, too expensive for TabPFN at 25 repeats. Two
@@ -761,6 +775,10 @@ python p53_od_pipeline.py --stat-test outputs/week5_feature_bagging.csv \
 ```
 
 ### Step 3 — heterogeneous ensemble: Top-3 from Step 1
+
+![Heterogeneous ensemble concept with TabPFN (slide)](figures/14_heterogeneous_ensemble_concept.png)
+
+![Ensemble boxplots (slide)](figures/17_week5_ensemble_boxplots.png)
 
 `isolation_forest`, `tabpfn`, `knn` (Step 1's Top-3) combined on the same
 full 147-dim. feature space (no subspace split — opposite of Step 2).
