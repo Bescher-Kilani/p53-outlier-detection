@@ -43,6 +43,10 @@ Exploratory only (not OCC, uses labels through SMOTE): GMD + LOF + Random Projec
 
 ![Dimensionality reduction](docs/figures/03_dimensionality_reduction.png)
 
+![Detector families compared in Week 3 (from the slides)](docs/figures/11_detector_concepts.png)
+
+![Week 5: detector boxplots incl. TabPFN and Deep SVDD (from the slides)](docs/figures/15_week5_detector_boxplots.png)
+
 ![Hyperparameter optimization](docs/figures/06_hpo.png)
 
 Details, tables and significance results for every week: [docs/FULL_DOCUMENTATION.md](docs/FULL_DOCUMENTATION.md).
